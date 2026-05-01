@@ -1,0 +1,49 @@
+# /etc/systemd/system/denoise-pipeline.service
+# Benjamin Vinod | Module 1
+#
+# Auto-starts the SIP + Denoise/VAD pipeline on boot.
+# Install:
+#   sudo cp denoise-pipeline.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now denoise-pipeline.service
+
+[Unit]
+Description=Real-Time Denoise + VAD Pipeline (SIP/RTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/denoise-pipeline
+
+# Inject runtime config via environment; override with a drop-in or
+# /etc/denoise-pipeline.env on the instance.
+EnvironmentFile=-/etc/denoise-pipeline.env
+Environment="HOST=0.0.0.0"
+Environment="PORT=7000"
+Environment="VAD_AGGRESSIVENESS=2"
+Environment="RESAMPLE_CONVERTER=sinc_fastest"
+Environment="CW_NAMESPACE=DenoisePipeline"
+Environment="CW_FLUSH_INTERVAL=60"
+
+ExecStart=/opt/denoise-pipeline/venv/bin/python sip_server.py
+
+# Restart policy: restart on crash, but not on clean exit (e.g. SIGTERM from ALB drain)
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+# Logging: goes to journald (pick up with: journalctl -u denoise-pipeline -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=denoise-pipeline
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

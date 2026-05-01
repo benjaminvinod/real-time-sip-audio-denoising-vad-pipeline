@@ -1,0 +1,287 @@
+# infra.yaml  –  Benjamin Vinod | Module 1
+# AWS CloudFormation stack: ALB + ASG for the Denoise/VAD Pipeline.
+#
+# Deploy
+# ------
+#   aws cloudformation deploy \
+#     --template-file infra.yaml \
+#     --stack-name denoise-pipeline \
+#     --parameter-overrides \
+#         GoldenAMIId=ami-XXXXXXXX \
+#         VpcId=vpc-XXXXXXXX \
+#         SubnetIds="subnet-AAA,subnet-BBB" \
+#     --capabilities CAPABILITY_IAM
+#
+# Parameters you MUST supply
+# --------------------------
+#   GoldenAMIId  – the AMI baked by golden-ami.pkr.hcl
+#   VpcId        – your VPC
+#   SubnetIds    – comma-separated list of ≥2 public subnets
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Denoise+VAD Pipeline – ALB + ASG + CloudWatch"
+
+# ── parameters ───────────────────────────────────────────────────────────────
+
+Parameters:
+
+  GoldenAMIId:
+    Type: AWS::EC2::Image::Id
+    Description: "AMI ID produced by Packer (golden-ami.pkr.hcl)"
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, c5.large, c5.xlarge]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "≥2 public subnets in different AZs"
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: "EC2 key pair for SSH access (optional)"
+
+  MinInstances:
+    Type: Number
+    Default: 1
+
+  MaxInstances:
+    Type: Number
+    Default: 4
+
+  DesiredInstances:
+    Type: Number
+    Default: 2
+
+  AppPort:
+    Type: Number
+    Default: 7000
+    Description: "Flask/Socket.IO port (used by health check)"
+
+# ── conditions ───────────────────────────────────────────────────────────────
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+# ── resources ────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── IAM role so instances can write CloudWatch metrics ─────────────────────
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-instance-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: PutMetrics
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ── security groups ────────────────────────────────────────────────────────
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALB – allow HTTP/HTTPS inbound"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "EC2 instances – allow traffic from ALB + SIP/RTP"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Flask/Socket.IO from ALB
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        # SIP signalling (UDP 5070)
+        - IpProtocol: udp
+          FromPort: 5070
+          ToPort: 5070
+          CidrIp: "0.0.0.0/0"
+        # RTP media (UDP 5072)
+        - IpProtocol: udp
+          FromPort: 5072
+          ToPort: 5072
+          CidrIp: "0.0.0.0/0"
+
+  # ── Application Load Balancer ──────────────────────────────────────────────
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: !Ref AppPort
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── Launch Template ────────────────────────────────────────────────────────
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref GoldenAMIId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds: [!Ref InstanceSecurityGroup]
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+        # User-data: inject the CloudWatch namespace via the env file
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "AWS_REGION=${AWS::Region}" >> /etc/denoise-pipeline.env
+            echo "CW_NAMESPACE=DenoisePipeline" >> /etc/denoise-pipeline.env
+            systemctl restart denoise-pipeline.service
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+
+  # ── Auto Scaling Group ─────────────────────────────────────────────────────
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      DesiredCapacity: !Ref DesiredInstances
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+          PropagateAtLaunch: true
+
+  # ── Scaling policies ───────────────────────────────────────────────────────
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+  # ── CloudWatch alarms ──────────────────────────────────────────────────────
+
+  HighRTFAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-high-rtf"
+      AlarmDescription: "Average RTF exceeded 0.9 (approaching real-time limit)"
+      Namespace: DenoisePipeline
+      MetricName: AverageRTF
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0.9
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  HighTRTAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-high-trt"
+      AlarmDescription: "Average TRT exceeded 30 ms target"
+      Namespace: DenoisePipeline
+      MetricName: AverageTRT_ms
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 30.0
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ── outputs ───────────────────────────────────────────────────────────────────
+
+Outputs:
+
+  ALBDNSName:
+    Description: "DNS name of the Application Load Balancer"
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-alb-dns"
+
+  ASGName:
+    Description: "Auto Scaling Group name"
+    Value: !Ref ASG
