@@ -358,13 +358,45 @@ async function resetStats() {
 
 async function clearAudio() {
   try {
-    await fetch(`${SERVER_URL}/clear_audio`, {
+    // 🔥 call backend
+    const res = await fetch(`${SERVER_URL}/clear_audio`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify({})
     });
-    appendLog("system", "Audio cleared via /clear_audio");
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    // 🧹 INSTANT UI RESET (do NOT wait for socket event)
+    document.getElementById("m-total").textContent = "0";
+    document.getElementById("m-speech").textContent = "0";
+    document.getElementById("m-silence").textContent = "0";
+    document.getElementById("m-ratio").textContent = "0.0%";
+    document.getElementById("m-latency").textContent = "0.0 ms";
+    document.getElementById("m-fps").textContent = "0.0 fps";
+    document.getElementById("m-snr").textContent = "0.0 dB";
+
+    document.getElementById("m-starts").textContent = "0";
+    document.getElementById("m-ends").textContent = "0";
+
+    // reset bars
+    document.getElementById("bar-raw").style.width = "0%";
+    document.getElementById("bar-clean").style.width = "0%";
+    document.getElementById("bar-delta").style.width = "0%";
+
+    // reset health bar
+    document.getElementById("health-fill").style.width = "0%";
+    document.getElementById("health-val").textContent = "0%";
+
+    // reset state
+    document.getElementById("state-label").textContent = "IDLE";
+
+    appendLog("system", "🧹 Audio cleared successfully");
+
   } catch (e) {
+    console.error("Clear audio failed:", e);
     appendLog("error", `Clear audio failed: ${e.message}`);
   }
 }

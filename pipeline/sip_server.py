@@ -96,34 +96,43 @@ class SocketEmitter:
              raw_energy: float = 0.0, denoised_energy: float = 0.0,
              snr_db: float = 0.0,
              speech_event: str = ""):
+
         global _trt_sum, _trt_count
 
-        # Build aggregated stats snapshot (computed below after updating LATEST_DATA)
+        now = time.time()
+
+        # ── BASE PAYLOAD (frame-level) ────────────────────────────────────────
         payload = {
             "seq":             seq,
             "data":            base64.b64encode(pcm16.tobytes()).decode(),
-            "is_speech":       is_speech,
+            "is_speech":       bool(is_speech),   # ✅ ensure strict boolean
             "call_id":         self.call_id,
-            "raw_energy":      raw_energy,
-            "denoised_energy": denoised_energy,
-            "snr_db":          snr_db,
+            "raw_energy":      float(raw_energy),
+            "denoised_energy": float(denoised_energy),
+            "snr_db":          float(snr_db),
             "speech_event":    speech_event,
         }
 
-        now = time.time()
         with _data_lock:
-            LATEST_DATA["seq"]           = seq
-            LATEST_DATA["is_speech"]     = is_speech
-            LATEST_DATA["frame_count"]  += 1
+            # ── FRAME COUNTS ────────────────────────────────────────────────
+            LATEST_DATA["seq"]          = seq
+            LATEST_DATA["is_speech"]    = bool(is_speech)
+            LATEST_DATA["frame_count"] += 1
+
             if is_speech:
                 LATEST_DATA["speech_count"] += 1
             else:
                 LATEST_DATA["silence_count"] += 1
 
             total = LATEST_DATA["frame_count"]
+
+            # ── SAFE RATIO CALCULATION ──────────────────────────────────────
             LATEST_DATA["speech_ratio"] = (
-                LATEST_DATA["speech_count"] / total * 100 if total > 0 else 0.0
+                (LATEST_DATA["speech_count"] / total) * 100.0
+                if total > 0 else 0.0
             )
+
+            # ── STATE + METADATA ────────────────────────────────────────────
             LATEST_DATA["last_updated"]    = now
             LATEST_DATA["rtp_active"]      = True
             LATEST_DATA["last_state"]      = "speech" if is_speech else "silence"
@@ -132,34 +141,47 @@ class SocketEmitter:
             LATEST_DATA["snr_db"]          = snr_db
             LATEST_DATA["server_ts"]       = now
 
+            # ── SPEECH EVENTS ───────────────────────────────────────────────
             if speech_event == "speech_start":
                 LATEST_DATA["speech_start_count"] += 1
             elif speech_event == "speech_end":
                 LATEST_DATA["speech_end_count"] += 1
 
+            # ── LATENCY (TRT) ───────────────────────────────────────────────
             if trt_ms > 0:
                 _trt_sum   += trt_ms
                 _trt_count += 1
-                LATEST_DATA["avg_trt"] = _trt_sum / _trt_count
+                if _trt_count > 0:
+                    LATEST_DATA["avg_trt"] = _trt_sum / _trt_count
+                else:
+                    LATEST_DATA["avg_trt"] = 0.0
 
+            # ── FPS CALCULATION ─────────────────────────────────────────────
             _frame_timestamps.append(now)
             cutoff = now - 1.0
-            LATEST_DATA["fps"] = float(sum(1 for t in _frame_timestamps if t >= cutoff))
+            LATEST_DATA["fps"] = float(
+                sum(1 for t in _frame_timestamps if t >= cutoff)
+            )
 
-            # Enrich payload with aggregated dashboard metrics
+            # ── AGGREGATED PAYLOAD (dashboard-level) ────────────────────────
             payload.update({
                 "total_frames":   LATEST_DATA["frame_count"],
                 "speech_frames":  LATEST_DATA["speech_count"],
                 "silence_frames": LATEST_DATA["silence_count"],
                 "speech_ratio":   LATEST_DATA["speech_ratio"],
-                "avg_latency":    LATEST_DATA["avg_trt"],
-                "fps":            LATEST_DATA["fps"],
+                "avg_latency":    LATEST_DATA.get("avg_trt", 0.0),
+                "fps":            LATEST_DATA.get("fps", 0.0),
                 "speech_start":   LATEST_DATA["speech_start_count"],
                 "speech_end":     LATEST_DATA["speech_end_count"],
-                "active_calls":   LATEST_DATA["active_calls"],
+                "active_calls":   LATEST_DATA.get("active_calls", 1),
                 "timestamp":      now,
             })
-        self.sio.emit("processedAudio", payload)
+
+        # ── EMIT TO FRONTEND ────────────────────────────────────────────────
+        try:
+            self.sio.emit("processedAudio", payload)
+        except Exception as e:
+            print(f"⚠️ Socket emit error: {e}")
 
 
 # ── Flask endpoints ───────────────────────────────────────────────────────────
@@ -206,32 +228,28 @@ def reset_endpoint():
 
 @app.route("/clear_audio", methods=["POST"])
 def clear_audio():
-    """
-    audioClear interrupt — resets all active call handlers and counters.
-    Called by Streamlit interrupt button.
-    """
-    call_id = request.json.get("call_id") if request.is_json else None
-    if call_id and call_id in CALL_SESSIONS:
-        session = CALL_SESSIONS[call_id]
-        if session.get("handler"):
-            session["handler"].reset()
-    else:
-        # Reset all
-        for sess in CALL_SESSIONS.values():
-            if sess.get("handler"):
-                sess["handler"].reset()
+    global LATEST_DATA, _trt_sum, _trt_count, _frame_timestamps
 
-    global _trt_sum, _trt_count
-    _trt_sum   = 0.0
-    _trt_count = 0
-    _frame_timestamps.clear()
     with _data_lock:
         LATEST_DATA.update({
-            "frame_count": 0, "speech_count": 0,
-            "silence_count": 0, "speech_ratio": 0.0,
-            "last_state": "silence", "avg_trt": 0.0, "fps": 0.0,
-            "raw_energy": 0.0, "denoised_energy": 0.0, "snr_db": 0.0,
+            "seq": 0,
+            "frame_count": 0,
+            "speech_count": 0,
+            "silence_count": 0,
+            "speech_ratio": 0.0,
+            "avg_trt": 0.0,
+            "fps": 0.0,
+            "speech_start_count": 0,
+            "speech_end_count": 0,
         })
+
+        _trt_sum = 0.0
+        _trt_count = 0
+        _frame_timestamps.clear()
+
+    # notify frontend instantly
+    sio.emit("audioCleared", {"status": "ok"})
+
     return jsonify({"status": "cleared"})
 
 
@@ -410,6 +428,10 @@ class RTPReceiver:
 
         self._jitter   = JitterBuffer()
 
+        # ✅ NEW: speech smoothing buffer
+        from collections import deque
+        self._speech_history = deque(maxlen=5)
+
     # ── Dummy RTP keep-alive ──────────────────────────────────────────────────
 
     def _send_dummy_rtp(self, addr):
@@ -486,19 +508,34 @@ class RTPReceiver:
 
             trt_ms = (time.perf_counter() - t_recv) * 1000.0
 
+            # ── SEND RTP BACK ────────────────────────────────────────────────
             self.sender.send(denoised)
 
+            # ── NEW: VAD SMOOTHING ───────────────────────────────────────────
+            self._speech_history.append(1 if is_speech else 0)
+            smoothed_speech = sum(self._speech_history) >= 3
+
+            # ── EMIT TO FRONTEND ─────────────────────────────────────────────
             if self.emitter:
                 self.emitter.send(
-                    self._seq, denoised, is_speech, trt_ms=trt_ms,
+                    self._seq,
+                    denoised,
+                    smoothed_speech,  # ✅ FIXED (was is_speech)
+                    trt_ms=trt_ms,
                     raw_energy=snr_info.get("raw_energy", 0.0),
                     denoised_energy=snr_info.get("denoised_energy", 0.0),
                     snr_db=snr_info.get("snr_db", 0.0),
                     speech_event=speech_event,
                 )
 
-            # Send to downstream AI (stub)
-            if is_speech:
+                # ── NEW: HEARTBEAT ──────────────────────────────────────────
+                try:
+                    sio.emit("heartbeat", {"ts": time.time()})
+                except Exception:
+                    pass
+
+            # ── DOWNSTREAM AI (unchanged) ────────────────────────────────────
+            if smoothed_speech:   # ✅ use smoothed instead of raw
                 send_to_ai(self._seq, denoised, self.call_id)
 
             self._seq += 1
