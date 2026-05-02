@@ -13,6 +13,9 @@ Features added:
   - Socket.IO emit per call
 """
 
+import eventlet
+eventlet.monkey_patch()
+
 import audioop
 import heapq
 import random
@@ -36,7 +39,12 @@ from ai_client import send_to_ai  # stub — safe import
 
 # ── Socket.IO / Flask setup ───────────────────────────────────────────────────
 
-sio = socketio.Server(cors_allowed_origins="*")
+sio = socketio.Server(
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    ping_timeout=60,
+    ping_interval=25
+)
 app = Flask(__name__)
 app.wsgi_app = socketio.WSGIApp(sio, app.wsgi_app)
 
@@ -90,6 +98,7 @@ class SocketEmitter:
              speech_event: str = ""):
         global _trt_sum, _trt_count
 
+        # Build aggregated stats snapshot (computed below after updating LATEST_DATA)
         payload = {
             "seq":             seq,
             "data":            base64.b64encode(pcm16.tobytes()).decode(),
@@ -100,7 +109,6 @@ class SocketEmitter:
             "snr_db":          snr_db,
             "speech_event":    speech_event,
         }
-        self.sio.emit("processedAudio", payload)
 
         now = time.time()
         with _data_lock:
@@ -137,6 +145,21 @@ class SocketEmitter:
             _frame_timestamps.append(now)
             cutoff = now - 1.0
             LATEST_DATA["fps"] = float(sum(1 for t in _frame_timestamps if t >= cutoff))
+
+            # Enrich payload with aggregated dashboard metrics
+            payload.update({
+                "total_frames":   LATEST_DATA["frame_count"],
+                "speech_frames":  LATEST_DATA["speech_count"],
+                "silence_frames": LATEST_DATA["silence_count"],
+                "speech_ratio":   LATEST_DATA["speech_ratio"],
+                "avg_latency":    LATEST_DATA["avg_trt"],
+                "fps":            LATEST_DATA["fps"],
+                "speech_start":   LATEST_DATA["speech_start_count"],
+                "speech_end":     LATEST_DATA["speech_end_count"],
+                "active_calls":   LATEST_DATA["active_calls"],
+                "timestamp":      now,
+            })
+        self.sio.emit("processedAudio", payload)
 
 
 # ── Flask endpoints ───────────────────────────────────────────────────────────
@@ -776,5 +799,4 @@ if __name__ == "__main__":
     threading.Thread(target=server.start, daemon=True).start()
 
     print("🌐 Starting Socket.IO/Flask server on port 5000…")
-    import eventlet
     eventlet.wsgi.server(eventlet.listen(("0.0.0.0", 5000)), app)

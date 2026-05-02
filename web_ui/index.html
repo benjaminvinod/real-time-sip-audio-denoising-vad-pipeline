@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SIP·VAD Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ── Ambient grid background ── -->
+  <div class="grid-bg" aria-hidden="true"></div>
+  <div class="scanline" aria-hidden="true"></div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       HEADER
+  ══════════════════════════════════════════════════════════ -->
+  <header class="site-header">
+    <div class="logo">
+      <span class="logo-icon">◈</span>
+      <span class="logo-text">SIP<em>·</em>VAD<span class="logo-sub">MONITOR</span></span>
+    </div>
+
+    <div class="header-center">
+      <div id="state-badge" class="state-badge state-idle">
+        <span class="state-dot"></span>
+        <span id="state-label">IDLE</span>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="conn-pill" id="conn-pill">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="conn-label">DISCONNECTED</span>
+      </div>
+      <div class="heartbeat-wrap">
+        <span class="hb-icon" id="hb-icon">♥</span>
+        <span class="hb-ts" id="hb-ts">—</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ══════════════════════════════════════════════════════════
+       SYSTEM HEALTH BAR
+  ══════════════════════════════════════════════════════════ -->
+  <div class="health-bar-wrap">
+    <div class="health-label">SPEECH RATIO</div>
+    <div class="health-track">
+      <div class="health-fill" id="health-fill"></div>
+      <div class="health-val" id="health-val">0%</div>
+    </div>
+    <div class="health-label right" id="active-calls-label">0 CALLS</div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════
+       METRIC CARDS GRID
+  ══════════════════════════════════════════════════════════ -->
+  <section class="metrics-grid" aria-label="Key metrics">
+
+    <div class="card" data-accent="cyan">
+      <div class="card-label">TOTAL FRAMES</div>
+      <div class="card-value" id="m-total">0</div>
+      <div class="card-sub">frames processed</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="green">
+      <div class="card-label">SPEECH FRAMES</div>
+      <div class="card-value" id="m-speech">0</div>
+      <div class="card-sub">voice active</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="slate">
+      <div class="card-label">SILENCE FRAMES</div>
+      <div class="card-value" id="m-silence">0</div>
+      <div class="card-sub">no activity</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="amber">
+      <div class="card-label">SPEECH RATIO</div>
+      <div class="card-value" id="m-ratio">0.0<span class="unit">%</span></div>
+      <div class="card-sub">voice / total</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="red">
+      <div class="card-label">AVG LATENCY</div>
+      <div class="card-value" id="m-latency">0.0<span class="unit">ms</span></div>
+      <div class="card-sub">turn-round time</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="violet">
+      <div class="card-label">THROUGHPUT</div>
+      <div class="card-value" id="m-fps">0.0<span class="unit">fps</span></div>
+      <div class="card-sub">frames per second</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="teal">
+      <div class="card-label">SNR IMPROVEMENT</div>
+      <div class="card-value" id="m-snr">0.0<span class="unit">dB</span></div>
+      <div class="card-sub">denoised quality</div>
+      <div class="card-glow"></div>
+    </div>
+
+    <div class="card" data-accent="orange">
+      <div class="card-label">SPEECH BOUNDARIES</div>
+      <div class="card-value" id="m-boundaries">
+        <span id="m-starts">0</span><span class="sep">↑</span><span id="m-ends">0</span><span class="unit">↓</span>
+      </div>
+      <div class="card-sub">start / end events</div>
+      <div class="card-glow"></div>
+    </div>
+
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════
+       CHARTS ROW
+  ══════════════════════════════════════════════════════════ -->
+  <section class="charts-row" aria-label="Real-time charts">
+
+    <div class="chart-card wide">
+      <div class="chart-header">
+        <span class="chart-title">Speech Ratio <em>rolling window</em></span>
+        <span class="chart-tag" id="ratio-live">— %</span>
+      </div>
+      <canvas id="chart-ratio" height="100"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-header">
+        <span class="chart-title">FPS vs Latency</span>
+        <span class="chart-tag" id="perf-live">— fps</span>
+      </div>
+      <canvas id="chart-perf" height="100"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-header">
+        <span class="chart-title">SNR (dB) over time</span>
+        <span class="chart-tag" id="snr-live">— dB</span>
+      </div>
+      <canvas id="chart-snr" height="100"></canvas>
+    </div>
+
+  </section>
+
+  <!-- ══════════════════════════════════════════════════════════
+       BOTTOM ROW: Energy bar + Event Log
+  ══════════════════════════════════════════════════════════ -->
+  <section class="bottom-row">
+
+    <!-- Energy comparison panel -->
+    <div class="energy-panel">
+      <div class="panel-title">AUDIO ENERGY</div>
+      <div class="energy-row">
+        <span class="energy-lbl">RAW</span>
+        <div class="energy-track">
+          <div class="energy-bar raw" id="bar-raw"></div>
+        </div>
+        <span class="energy-num" id="num-raw">0</span>
+      </div>
+      <div class="energy-row">
+        <span class="energy-lbl">CLEAN</span>
+        <div class="energy-track">
+          <div class="energy-bar clean" id="bar-clean"></div>
+        </div>
+        <span class="energy-num" id="num-clean">0</span>
+      </div>
+      <div class="energy-row">
+        <span class="energy-lbl">DELTA</span>
+        <div class="energy-track">
+          <div class="energy-bar delta" id="bar-delta"></div>
+        </div>
+        <span class="energy-num" id="num-delta">0 dB</span>
+      </div>
+
+      <div class="panel-title" style="margin-top:1.5rem;">CONTROLS</div>
+      <div class="ctrl-row">
+        <button class="ctrl-btn" id="btn-reset" onclick="resetStats()">↺ RESET</button>
+        <button class="ctrl-btn danger" id="btn-clear" onclick="clearAudio()">✕ CLEAR AUDIO</button>
+      </div>
+    </div>
+
+    <!-- Event log -->
+    <div class="log-panel">
+      <div class="panel-title">
+        EVENT LOG
+        <span class="log-count" id="log-count">0 events</span>
+      </div>
+      <div class="log-scroll" id="event-log" role="log" aria-live="polite"></div>
+    </div>
+
+  </section>
+
+  <!-- ── Footer ── -->
+  <footer class="site-footer">
+    <span>SIP·VAD Monitor — WebSocket Edition</span>
+    <span id="footer-seq">SEQ #—</span>
+    <span id="footer-calls">— active calls</span>
+  </footer>
+
+  <!-- ── Scripts ── -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
