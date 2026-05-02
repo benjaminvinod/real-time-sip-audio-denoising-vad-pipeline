@@ -177,6 +177,26 @@ class RTPReceiver:
 
         self.emitter = None
 
+    # 🔥 NEW: Dummy RTP sender to keep call alive
+    def _send_dummy_rtp(self, addr):
+        client_ip, client_port = addr
+
+        header = struct.pack(
+            "!BBHII",
+            0x80,
+            RTP_PAYLOAD_TYPE,
+            self._seq & 0xFFFF,
+            self._seq * 160,
+            0
+        )
+
+        payload = b'\xff' * 160  # 20ms fake audio
+
+        try:
+            self.sock.sendto(header + payload, (client_ip, client_port))
+        except Exception as e:
+            print(f"⚠️ Dummy RTP send error: {e}")
+
     def listen(self):
         print(f"👂 RTP Listener active on UDP port {self.port}")
         self.running = True
@@ -197,6 +217,9 @@ class RTPReceiver:
             if self._pkt_count <= 5 or self._pkt_count % 50 == 0:
                 print(f"📦 RTP packet #{self._pkt_count} from {addr} "
                       f"({len(data)} bytes)")
+
+            # 🔥 NEW: send RTP back immediately (CRITICAL FIX)
+            self._send_dummy_rtp(addr)
 
             t_recv = time.perf_counter()
 
