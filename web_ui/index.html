@@ -1,34 +1,677 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SIP·VAD Monitor</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SIP · VAD Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet" />
+
+<style>
+/* ═══════════════════════════════════════════════════
+   DESIGN TOKENS — terminal-noir / phosphor-green
+═══════════════════════════════════════════════════ */
+:root {
+  --bg:           #040608;
+  --bg2:          #070c0f;
+  --surface:      #0b1014;
+  --surface2:     #101820;
+  --border:       #1a2830;
+  --border2:      #243540;
+
+  --phos:         #00ff88;          /* phosphor green — primary accent */
+  --phos-dim:     rgba(0,255,136,0.12);
+  --phos-glow:    rgba(0,255,136,0.35);
+  --phos-mid:     #00cc6a;
+
+  --amber:        #ffaa00;
+  --amber-dim:    rgba(255,170,0,0.12);
+  --cyan:         #00d8ff;
+  --cyan-dim:     rgba(0,216,255,0.10);
+  --red:          #ff3355;
+  --red-dim:      rgba(255,51,85,0.12);
+  --violet:       #bb88ff;
+  --violet-dim:   rgba(187,136,255,0.10);
+  --orange:       #ff7730;
+
+  --text:         #9ab8c4;
+  --text-dim:     #3d5560;
+  --text-bright:  #d0eaf0;
+  --mono:         'Share Tech Mono', monospace;
+  --display:      'Orbitron', sans-serif;
+
+  --radius:       4px;
+  --panel-gap:    12px;
+}
+
+/* ═══════════════════════════════════════════════════
+   BASE
+═══════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+/* CRT scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.18) 2px,
+    rgba(0,0,0,0.18) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Oscilloscope grid background */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0,255,136,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,255,136,0.025) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.shell {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0 var(--panel-gap) var(--panel-gap);
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+/* ═══════════════════════════════════════════════════
+   HEADER
+═══════════════════════════════════════════════════ */
+.header {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding: 10px 0 10px;
+  margin-bottom: var(--panel-gap);
+  gap: 12px;
+}
+
+.logo {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.logo-mark {
+  font-family: var(--display);
+  font-size: 1.4rem;
+  font-weight: 900;
+  color: var(--phos);
+  text-shadow: 0 0 18px var(--phos-glow);
+  letter-spacing: 0.06em;
+}
+.logo-sub {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border-left: 1px solid var(--border2);
+  padding-left: 8px;
+  margin-left: 4px;
+}
+
+/* Speaking/Silent badge — center */
+.state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 16px;
+  border-radius: 999px;
+  font-family: var(--display);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  border: 1px solid var(--border2);
+  background: var(--surface);
+  color: var(--text-dim);
+  transition: all 0.2s ease;
+}
+.state-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: all 0.2s ease;
+}
+.state-badge.speaking {
+  background: var(--phos-dim);
+  border-color: var(--phos);
+  color: var(--phos);
+  box-shadow: 0 0 20px var(--phos-glow);
+}
+.state-badge.speaking .state-dot {
+  background: var(--phos);
+  box-shadow: 0 0 8px var(--phos);
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+.state-badge.silent {
+  background: var(--surface2);
+  border-color: var(--border2);
+  color: var(--text-dim);
+}
+.state-badge.silent .state-dot { background: var(--text-dim); }
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.65); }
+}
+
+/* Right cluster */
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  justify-content: flex-end;
+}
+
+.conn-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.65rem;
+  letter-spacing: 0.15em;
+  color: var(--text-dim);
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  transition: all 0.25s;
+}
+.conn-pill.connected {
+  border-color: var(--phos);
+  color: var(--phos);
+}
+.conn-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: all 0.25s;
+}
+.conn-pill.connected .conn-dot {
+  background: var(--phos);
+  box-shadow: 0 0 6px var(--phos);
+}
+
+.hb-wrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+.hb-icon {
+  font-size: 0.85rem;
+  color: var(--red);
+  display: inline-block;
+}
+.hb-icon.pulse {
+  animation: hb-beat 0.4s ease-out;
+}
+@keyframes hb-beat {
+  0%   { transform: scale(1);   color: var(--phos); }
+  40%  { transform: scale(1.5); color: var(--phos); text-shadow: 0 0 10px var(--phos); }
+  100% { transform: scale(1);   color: var(--red); }
+}
+
+/* ═══════════════════════════════════════════════════
+   SPEECH RATIO HEALTH BAR
+═══════════════════════════════════════════════════ */
+.health-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: var(--panel-gap);
+}
+.health-bar-label {
+  font-size: 0.6rem;
+  letter-spacing: 0.2em;
+  color: var(--text-dim);
+  white-space: nowrap;
+  min-width: 96px;
+}
+.health-track {
+  flex: 1;
+  height: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+  position: relative;
+}
+.health-fill {
+  height: 100%;
+  background: var(--phos);
+  border-radius: 999px;
+  box-shadow: 0 0 8px var(--phos-glow);
+  transition: width 0.3s ease;
+  width: 0%;
+}
+.health-val {
+  font-size: 0.72rem;
+  color: var(--phos);
+  min-width: 42px;
+  text-align: right;
+}
+.health-calls {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.15em;
+  min-width: 70px;
+  text-align: right;
+}
+
+/* ═══════════════════════════════════════════════════
+   METRIC CARDS ROW
+═══════════════════════════════════════════════════ */
+.metrics-row {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: var(--panel-gap);
+  margin-bottom: var(--panel-gap);
+}
+
+.m-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px 9px;
+  position: relative;
+  overflow: hidden;
+}
+.m-card::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+}
+.m-card[data-c="phos"]::after   { background: var(--phos); }
+.m-card[data-c="green"]::after  { background: #22d3ee; }
+.m-card[data-c="slate"]::after  { background: var(--border2); }
+.m-card[data-c="amber"]::after  { background: var(--amber); }
+.m-card[data-c="red"]::after    { background: var(--red); }
+.m-card[data-c="violet"]::after { background: var(--violet); }
+.m-card[data-c="teal"]::after   { background: #2dd4bf; }
+.m-card[data-c="orange"]::after { background: var(--orange); }
+
+.m-lbl {
+  font-size: 0.55rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.m-val {
+  font-family: var(--display);
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: var(--text-bright);
+  line-height: 1;
+  white-space: nowrap;
+}
+.m-val[data-c="phos"]   { color: var(--phos); text-shadow: 0 0 10px var(--phos-glow); }
+.m-val[data-c="green"]  { color: #22d3ee; }
+.m-val[data-c="amber"]  { color: var(--amber); }
+.m-val[data-c="red"]    { color: var(--red); }
+.m-val[data-c="violet"] { color: var(--violet); }
+.m-val[data-c="teal"]   { color: #2dd4bf; }
+.m-val[data-c="orange"] { color: var(--orange); }
+.unit { font-size: 0.7rem; font-weight: 400; opacity: 0.6; margin-left: 2px; }
+.m-sub {
+  font-size: 0.55rem;
+  color: var(--text-dim);
+  margin-top: 3px;
+  letter-spacing: 0.05em;
+}
+.boundary-val { display: flex; align-items: center; gap: 6px; }
+.boundary-val .sep { color: var(--border2); font-size: 0.9rem; }
+
+/* ═══════════════════════════════════════════════════
+   CHARTS ROW
+═══════════════════════════════════════════════════ */
+.charts-row {
+  display: grid;
+  grid-template-columns: 2fr 1.2fr 1.2fr;
+  gap: var(--panel-gap);
+  margin-bottom: var(--panel-gap);
+}
+
+.chart-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chart-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.chart-title {
+  font-size: 0.6rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.chart-live {
+  font-size: 0.65rem;
+  color: var(--phos);
+  font-family: var(--display);
+  font-weight: 700;
+}
+.chart-wrap {
+  position: relative;
+  height: 80px;
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════════════
+   BOTTOM GRID: Energy | Log | Transcript
+═══════════════════════════════════════════════════ */
+.bottom-grid {
+  display: grid;
+  grid-template-columns: 200px 1fr 1.2fr;
+  gap: var(--panel-gap);
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── Shared panel frame ── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 220px;
+  max-height: 320px;
+  overflow: hidden;
+}
+.panel-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.panel-title {
+  font-size: 0.6rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.panel-count {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+}
+
+/* ── Energy panel ── */
+.energy-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+.energy-row {
+  display: grid;
+  grid-template-columns: 38px 1fr 52px;
+  align-items: center;
+  gap: 6px;
+}
+.energy-lbl { font-size: 0.6rem; letter-spacing: 0.1em; color: var(--text-dim); }
+.energy-track {
+  height: 5px;
+  background: var(--surface2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.energy-bar {
+  height: 100%;
+  border-radius: 999px;
+  width: 0%;
+  transition: width 0.25s ease;
+}
+.energy-bar.raw   { background: var(--amber); }
+.energy-bar.clean { background: var(--phos); }
+.energy-bar.delta { background: var(--cyan); }
+.energy-num { font-size: 0.62rem; color: var(--text); text-align: right; }
+
+/* Control buttons */
+.ctrl-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.ctrl-btn {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.12em;
+  padding: 5px 4px;
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.2s;
+  text-transform: uppercase;
+}
+.ctrl-btn:hover {
+  border-color: var(--phos);
+  color: var(--phos);
+  background: var(--phos-dim);
+}
+.ctrl-btn.danger:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+/* ── Log panel ── */
+.log-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border2) transparent;
+}
+.log-row {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  gap: 6px;
+  padding: 2px 10px;
+  font-size: 0.65rem;
+  border-bottom: 1px solid rgba(26,40,48,0.5);
+  transition: background 0.1s;
+}
+.log-row:hover { background: var(--surface2); }
+.log-ts { color: var(--text-dim); font-size: 0.6rem; }
+.log-msg { color: var(--text); word-break: break-all; }
+.log-row.log-system  .log-msg { color: var(--text-dim); }
+.log-row.log-speech  .log-msg { color: var(--phos); }
+.log-row.log-silence .log-msg { color: #3d6070; }
+.log-row.log-event   .log-msg { color: var(--amber); }
+.log-row.log-warn    .log-msg { color: var(--orange); }
+.log-row.log-error   .log-msg { color: var(--red); }
+
+/* ── Transcript panel ── */
+.transcript-panel {
+  border-color: rgba(0,255,136,0.2);
+}
+.transcript-panel .panel-hdr {
+  border-bottom-color: rgba(0,255,136,0.15);
+  background: rgba(0,255,136,0.03);
+}
+.transcript-panel .panel-title {
+  color: var(--phos-mid);
+}
+
+.tx-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 0 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0,255,136,0.2) transparent;
+}
+.tx-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  letter-spacing: 0.15em;
+  opacity: 0.5;
+}
+
+.tx-row {
+  padding: 7px 12px 6px;
+  border-bottom: 1px solid rgba(0,255,136,0.07);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  transition: background 0.15s;
+}
+.tx-row:hover { background: rgba(0,255,136,0.03); }
+.tx-row:last-child { border-bottom: none; }
+
+/* Teletype entry animation */
+.tx-row.new-entry {
+  animation: tx-arrive 0.35s ease-out;
+}
+@keyframes tx-arrive {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+    background: rgba(0,255,136,0.06);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+    background: transparent;
+  }
+}
+
+.tx-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.tx-ts {
+  font-size: 0.58rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.tx-call {
+  font-size: 0.58rem;
+  color: var(--phos-mid);
+  opacity: 0.7;
+  white-space: nowrap;
+}
+.tx-text {
+  font-size: 0.8rem;
+  color: var(--text-bright);
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+}
+.tx-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  background: var(--phos);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cursor-blink 1s step-end infinite;
+}
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.tx-count { color: var(--phos-mid); }
+
+/* ═══════════════════════════════════════════════════
+   FOOTER
+═══════════════════════════════════════════════════ */
+.site-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  padding: 6px 0;
+  margin-top: var(--panel-gap);
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+}
+.footer-center { display: flex; gap: 20px; }
+.footer-right  { display: flex; gap: 16px; }
+#footer-seq    { color: var(--amber); }
+
+/* ═══════════════════════════════════════════════════
+   DEBUG BAR (hidden by default, shown via ?debug=1)
+═══════════════════════════════════════════════════ */
+.debug-bar {
+  display: none;
+  background: var(--red-dim);
+  border: 1px solid var(--red);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  font-size: 0.6rem;
+  color: var(--red);
+  letter-spacing: 0.1em;
+  margin-bottom: var(--panel-gap);
+}
+.debug-bar.visible { display: block; }
+#debug-line { font-family: var(--mono); }
+</style>
 </head>
+
 <body>
+<div class="shell">
 
-  <!-- ── Ambient grid background ── -->
-  <div class="grid-bg" aria-hidden="true"></div>
-  <div class="scanline" aria-hidden="true"></div>
-
-  <!-- ══════════════════════════════════════════════════════════
-       HEADER
-  ══════════════════════════════════════════════════════════ -->
-  <header class="site-header">
+  <!-- ══════════════ HEADER ══════════════ -->
+  <header class="header">
     <div class="logo">
-      <span class="logo-icon">◈</span>
-      <span class="logo-text">SIP<em>·</em>VAD<span class="logo-sub">MONITOR</span></span>
+      <span class="logo-mark">SIP·VAD</span>
+      <span class="logo-sub">MONITOR v2</span>
     </div>
 
-    <div class="header-center">
-      <div id="state-badge" class="state-badge state-idle">
-        <span class="state-dot"></span>
-        <span id="state-label">IDLE</span>
-      </div>
+    <div id="state-badge" class="state-badge">
+      <span class="state-dot" id="state-dot"></span>
+      <span id="state-label">IDLE</span>
     </div>
 
     <div class="header-right">
@@ -36,179 +679,194 @@
         <span class="conn-dot" id="conn-dot"></span>
         <span id="conn-label">DISCONNECTED</span>
       </div>
-      <div class="heartbeat-wrap">
+      <div class="hb-wrap">
         <span class="hb-icon" id="hb-icon">♥</span>
-        <span class="hb-ts" id="hb-ts">—</span>
+        <span id="hb-ts">—</span>
       </div>
     </div>
   </header>
 
-  <!-- ══════════════════════════════════════════════════════════
-       SYSTEM HEALTH BAR
-  ══════════════════════════════════════════════════════════ -->
-  <div class="health-bar-wrap">
-    <div class="health-label">SPEECH RATIO</div>
-    <div class="health-track">
-      <div class="health-fill" id="health-fill"></div>
-      <div class="health-val" id="health-val">0%</div>
-    </div>
-    <div class="health-label right" id="active-calls-label">0 CALLS</div>
+  <!-- ══════════════ DEBUG BAR ══════════════ -->
+  <div class="debug-bar" id="debug-bar">
+    ⚡ DEBUG MODE — <span id="debug-line">waiting for events…</span>
   </div>
 
-  <!-- ══════════════════════════════════════════════════════════
-       METRIC CARDS GRID
-  ══════════════════════════════════════════════════════════ -->
-  <section class="metrics-grid" aria-label="Key metrics">
+  <!-- ══════════════ HEALTH BAR ══════════════ -->
+  <div class="health-bar-row">
+    <span class="health-bar-label">SPEECH RATIO</span>
+    <div class="health-track">
+      <div class="health-fill" id="health-fill"></div>
+    </div>
+    <span class="health-val" id="health-val">0%</span>
+    <span class="health-calls" id="active-calls-label">0 CALLS</span>
+  </div>
 
-    <div class="card" data-accent="cyan">
-      <div class="card-label">TOTAL FRAMES</div>
-      <div class="card-value" id="m-total">0</div>
-      <div class="card-sub">frames processed</div>
-      <div class="card-glow"></div>
+  <!-- ══════════════ METRIC CARDS ══════════════ -->
+  <div class="metrics-row">
+
+    <div class="m-card" data-c="phos">
+      <div class="m-lbl">Total Frames</div>
+      <div class="m-val" id="m-total" data-c="phos">0</div>
+      <div class="m-sub">frames processed</div>
     </div>
 
-    <div class="card" data-accent="green">
-      <div class="card-label">SPEECH FRAMES</div>
-      <div class="card-value" id="m-speech">0</div>
-      <div class="card-sub">voice active</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="green">
+      <div class="m-lbl">Speech Frames</div>
+      <div class="m-val" id="m-speech" data-c="green">0</div>
+      <div class="m-sub">voice active</div>
     </div>
 
-    <div class="card" data-accent="slate">
-      <div class="card-label">SILENCE FRAMES</div>
-      <div class="card-value" id="m-silence">0</div>
-      <div class="card-sub">no activity</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="slate">
+      <div class="m-lbl">Silence Frames</div>
+      <div class="m-val" id="m-silence">0</div>
+      <div class="m-sub">no activity</div>
     </div>
 
-    <div class="card" data-accent="amber">
-      <div class="card-label">SPEECH RATIO</div>
-      <div class="card-value" id="m-ratio">0.0<span class="unit">%</span></div>
-      <div class="card-sub">voice / total</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="amber">
+      <div class="m-lbl">Speech Ratio</div>
+      <div class="m-val" id="m-ratio" data-c="amber">0.0<span class="unit">%</span></div>
+      <div class="m-sub">voice / total</div>
     </div>
 
-    <div class="card" data-accent="red">
-      <div class="card-label">AVG LATENCY</div>
-      <div class="card-value" id="m-latency">0.0<span class="unit">ms</span></div>
-      <div class="card-sub">turn-round time</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="red">
+      <div class="m-lbl">Avg Latency</div>
+      <div class="m-val" id="m-latency" data-c="red">0.0<span class="unit">ms</span></div>
+      <div class="m-sub">turn-round time</div>
     </div>
 
-    <div class="card" data-accent="violet">
-      <div class="card-label">THROUGHPUT</div>
-      <div class="card-value" id="m-fps">0.0<span class="unit">fps</span></div>
-      <div class="card-sub">frames per second</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="violet">
+      <div class="m-lbl">Throughput</div>
+      <div class="m-val" id="m-fps" data-c="violet">0.0<span class="unit">fps</span></div>
+      <div class="m-sub">frames per second</div>
     </div>
 
-    <div class="card" data-accent="teal">
-      <div class="card-label">SNR IMPROVEMENT</div>
-      <div class="card-value" id="m-snr">0.0<span class="unit">dB</span></div>
-      <div class="card-sub">denoised quality</div>
-      <div class="card-glow"></div>
+    <div class="m-card" data-c="teal">
+      <div class="m-lbl">SNR Improvement</div>
+      <div class="m-val" id="m-snr" data-c="teal">0.0<span class="unit">dB</span></div>
+      <div class="m-sub">denoised quality</div>
     </div>
 
-    <div class="card" data-accent="orange">
-      <div class="card-label">SPEECH BOUNDARIES</div>
-      <div class="card-value" id="m-boundaries">
-        <span id="m-starts">0</span><span class="sep">↑</span><span id="m-ends">0</span><span class="unit">↓</span>
+    <div class="m-card" data-c="orange">
+      <div class="m-lbl">Speech Boundaries</div>
+      <div class="m-val" id="m-boundaries" data-c="orange">
+        <div class="boundary-val">
+          <span id="m-starts">0</span>
+          <span class="sep">↑</span>
+          <span id="m-ends">0</span>
+          <span class="unit">↓</span>
+        </div>
       </div>
-      <div class="card-sub">start / end events</div>
-      <div class="card-glow"></div>
+      <div class="m-sub">start / end events</div>
     </div>
 
-  </section>
+  </div>
 
-  <!-- ══════════════════════════════════════════════════════════
-       CHARTS ROW
-  ══════════════════════════════════════════════════════════ -->
-  <section class="charts-row" aria-label="Real-time charts">
+  <!-- ══════════════ CHARTS ══════════════ -->
+  <div class="charts-row">
 
-    <div class="chart-card wide">
-      <div class="chart-header">
-        <span class="chart-title">Speech Ratio <em>rolling window</em></span>
-        <span class="chart-tag" id="ratio-live">— %</span>
+    <div class="chart-panel">
+      <div class="chart-hdr">
+        <span class="chart-title">Speech Ratio — rolling window</span>
+        <span class="chart-live" id="ratio-live">—%</span>
       </div>
-      <canvas id="chart-ratio" height="100"></canvas>
+      <div class="chart-wrap">
+        <canvas id="chart-ratio"></canvas>
+      </div>
     </div>
 
-    <div class="chart-card">
-      <div class="chart-header">
+    <div class="chart-panel">
+      <div class="chart-hdr">
         <span class="chart-title">FPS vs Latency</span>
-        <span class="chart-tag" id="perf-live">— fps</span>
+        <span class="chart-live" id="perf-live">— fps</span>
       </div>
-      <canvas id="chart-perf" height="100"></canvas>
+      <div class="chart-wrap">
+        <canvas id="chart-perf"></canvas>
+      </div>
     </div>
 
-    <div class="chart-card">
-      <div class="chart-header">
-        <span class="chart-title">SNR (dB) over time</span>
-        <span class="chart-tag" id="snr-live">— dB</span>
+    <div class="chart-panel">
+      <div class="chart-hdr">
+        <span class="chart-title">SNR over time</span>
+        <span class="chart-live" id="snr-live">— dB</span>
       </div>
-      <canvas id="chart-snr" height="100"></canvas>
+      <div class="chart-wrap">
+        <canvas id="chart-snr"></canvas>
+      </div>
     </div>
 
-  </section>
+  </div>
 
-  <!-- ══════════════════════════════════════════════════════════
-       BOTTOM ROW: Energy bar + Event Log
-  ══════════════════════════════════════════════════════════ -->
-  <section class="bottom-row">
+  <!-- ══════════════ BOTTOM GRID ══════════════ -->
+  <div class="bottom-grid">
 
-    <!-- Energy comparison panel -->
-    <div class="energy-panel">
-      <div class="panel-title">AUDIO ENERGY</div>
-      <div class="energy-row">
-        <span class="energy-lbl">RAW</span>
-        <div class="energy-track">
-          <div class="energy-bar raw" id="bar-raw"></div>
-        </div>
-        <span class="energy-num" id="num-raw">0</span>
+    <!-- Energy + Controls -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <span class="panel-title">Audio Energy</span>
       </div>
-      <div class="energy-row">
-        <span class="energy-lbl">CLEAN</span>
-        <div class="energy-track">
-          <div class="energy-bar clean" id="bar-clean"></div>
+      <div class="energy-body">
+        <div class="energy-row">
+          <span class="energy-lbl">RAW</span>
+          <div class="energy-track"><div class="energy-bar raw" id="bar-raw"></div></div>
+          <span class="energy-num" id="num-raw">0</span>
         </div>
-        <span class="energy-num" id="num-clean">0</span>
-      </div>
-      <div class="energy-row">
-        <span class="energy-lbl">DELTA</span>
-        <div class="energy-track">
-          <div class="energy-bar delta" id="bar-delta"></div>
+        <div class="energy-row">
+          <span class="energy-lbl">CLEAN</span>
+          <div class="energy-track"><div class="energy-bar clean" id="bar-clean"></div></div>
+          <span class="energy-num" id="num-clean">0</span>
         </div>
-        <span class="energy-num" id="num-delta">0 dB</span>
+        <div class="energy-row">
+          <span class="energy-lbl">DELTA</span>
+          <div class="energy-track"><div class="energy-bar delta" id="bar-delta"></div></div>
+          <span class="energy-num" id="num-delta">0 dB</span>
+        </div>
       </div>
-
-      <div class="panel-title" style="margin-top:1.5rem;">CONTROLS</div>
       <div class="ctrl-row">
-        <button class="ctrl-btn" id="btn-reset" onclick="resetStats()">↺ RESET</button>
-        <button class="ctrl-btn danger" id="btn-clear" onclick="clearAudio()">✕ CLEAR AUDIO</button>
+        <button class="ctrl-btn" onclick="resetStats()">↺ RESET</button>
+        <button class="ctrl-btn danger" onclick="clearAudio()">✕ CLEAR</button>
       </div>
     </div>
 
-    <!-- Event log -->
-    <div class="log-panel">
-      <div class="panel-title">
-        EVENT LOG
-        <span class="log-count" id="log-count">0 events</span>
+    <!-- Event Log -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <span class="panel-title">Event Log</span>
+        <span class="panel-count" id="log-count">0 events</span>
       </div>
       <div class="log-scroll" id="event-log" role="log" aria-live="polite"></div>
     </div>
 
-  </section>
+    <!-- Transcript -->
+    <div class="panel transcript-panel">
+      <div class="panel-hdr">
+        <span class="panel-title">⬡ Transcript</span>
+        <span class="panel-count tx-count" id="tx-count">0 segments</span>
+      </div>
+      <div class="tx-scroll" id="tx-scroll">
+        <div class="tx-empty" id="tx-empty">AWAITING SPEECH…</div>
+      </div>
+    </div>
 
-  <!-- ── Footer ── -->
+  </div>
+
+  <!-- ══════════════ FOOTER ══════════════ -->
   <footer class="site-footer">
     <span>SIP·VAD Monitor — WebSocket Edition</span>
-    <span id="footer-seq">SEQ #—</span>
-    <span id="footer-calls">— active calls</span>
+    <div class="footer-center">
+      <span id="footer-seq">SEQ #—</span>
+      <span id="footer-calls">— active calls</span>
+    </div>
+    <div class="footer-right">
+      <span id="footer-server">—</span>
+      <span id="footer-ts">—</span>
+    </div>
   </footer>
 
-  <!-- ── Scripts ── -->
-  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-  <script src="app.js"></script>
+</div><!-- .shell -->
+
+<!-- ── Scripts ── -->
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

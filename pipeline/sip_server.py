@@ -13,8 +13,12 @@ Features added:
   - Socket.IO emit per call
 """
 
+# ── eventlet monkey-patch MUST be absolutely first ───────────────────────────
+# faster_whisper / ssl / httpx must NOT be imported before this line.
+# Importing them first corrupts eventlet's cooperative socket patching and
+# causes SSL recursion errors + phantom socket hangs under load.
 import eventlet
-eventlet.monkey_patch()
+eventlet.monkey_patch(os=True, select=True, socket=True, thread=True, time=True)
 
 import audioop
 import heapq
@@ -26,6 +30,7 @@ import threading
 import time
 import base64
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import samplerate
@@ -36,6 +41,7 @@ import socketio
 from denoiseVADHandler import DenoiseVADHandler
 from metricsLogger import MetricsLogger
 from ai_client import send_to_ai  # stub — safe import
+
 
 # ── Socket.IO / Flask setup ───────────────────────────────────────────────────
 
@@ -427,6 +433,7 @@ class RTPReceiver:
         self.emitter: SocketEmitter | None = None
 
         self._jitter   = JitterBuffer()
+        self._speech_buffer = []
 
         # ✅ NEW: speech smoothing buffer
         from collections import deque
@@ -506,6 +513,10 @@ class RTPReceiver:
                 self._seq, frame, t_recv, self.metrics
             )
 
+            # ── Collect speech frames ─────────────────────────
+            if is_speech:
+                self._speech_buffer.append(denoised.copy())
+
             trt_ms = (time.perf_counter() - t_recv) * 1000.0
 
             # ── SEND RTP BACK ────────────────────────────────────────────────
@@ -537,6 +548,15 @@ class RTPReceiver:
             # ── DOWNSTREAM AI (unchanged) ────────────────────────────────────
             if smoothed_speech:   # ✅ use smoothed instead of raw
                 send_to_ai(self._seq, denoised, self.call_id)
+
+            # ── Speech segment ended → submit to STT (non-blocking) ───────────
+            # _stt_manager.submit() returns immediately — it never blocks the
+            # RTP thread. The audio copy and cooldown check happen here in O(1).
+            # Whisper runs in the background pool worker.
+            if speech_event == "speech_end" and self._speech_buffer:
+                segment = np.concatenate(self._speech_buffer)
+                self._speech_buffer.clear()   # clear immediately, safe — copy made in submit()
+                _stt_manager.submit(segment, self.call_id)
 
             self._seq += 1
 
@@ -643,6 +663,166 @@ def build_200_ok(headers: dict, server_ip: str, server_port: int,
         "\r\n"
         f"{sdp_body}"
     )
+
+# ── STT Manager ───────────────────────────────────────────────────────────────
+#
+# Design goals:
+#   1. Never block the RTP thread — all Whisper work runs in a dedicated pool
+#   2. Single worker (max_workers=1) — prevents CPU saturation from concurrent runs
+#   3. Cooldown between calls — silences that trigger speech_end too frequently
+#      are ignored without queuing up work
+#   4. Lazy model load — WhisperModel is imported and constructed only on the
+#      first actual transcription call, AFTER eventlet has fully patched.
+#      This avoids the SSL recursion issue caused by importing faster_whisper
+#      at module level before monkey_patch completes.
+#   5. Thread-safe model reference via a lock — safe for single-worker pool
+#
+# Why NOT raw threading.Thread:
+#   Raw threads are created per speech_end event with no upper bound. Under
+#   frequent speech activity this causes thread explosion, shared GIL pressure,
+#   and TRT spikes. A pool with max_workers=1 serialises STT work onto one OS
+#   thread and lets the RTP loop continue unaffected.
+
+class STTManager:
+    """
+    Non-blocking STT runner.
+    Submit speech buffers via .submit(); Whisper runs in background.
+    The RTP thread is never blocked.
+    """
+
+    # Minimum samples at 16 kHz to attempt transcription (1 second)
+    MIN_SAMPLES    = 16_000
+
+    # Seconds between STT submissions — prevents CPU overload from rapid
+    # speech_end events (e.g. VAD bouncing at silence/speech boundary)
+    COOLDOWN_SECS  = 2.0
+
+    def __init__(self):
+        # Single-worker pool: one Whisper job at a time, no thread explosion
+        self._pool          = ThreadPoolExecutor(max_workers=1)
+        self._model         = None          # lazy-loaded on first use
+        self._model_lock    = threading.Lock()
+        self._last_run_ts   = 0.0           # epoch of last submitted job
+        self._busy          = False         # True while a job is in-flight
+
+    def _load_model(self):
+        """Load WhisperModel exactly once, thread-safely."""
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                # Import here — AFTER eventlet.monkey_patch() has completed —
+                # to avoid SSL/socket recursion.
+                from faster_whisper import WhisperModel
+                print("📦 [STT] Loading Whisper tiny (CPU)…")
+                self._model = WhisperModel(
+                    "tiny",
+                    device="cpu",
+                    compute_type="int8",
+                    local_files_only=True,
+                )
+                print("✅ [STT] Whisper model ready")
+        return self._model
+
+    def submit(self, audio_np: np.ndarray, call_id: str) -> bool:
+        """
+        Non-blocking submission.
+        Returns True if the job was queued, False if skipped (cooldown / too short).
+        Called from the RTP thread — must return in microseconds.
+        """
+        now = time.monotonic()
+
+        # ── Minimum length guard ──────────────────────────────────────────────
+        if len(audio_np) < self.MIN_SAMPLES:
+            print(f"⏭️  [STT] Segment too short ({len(audio_np)} samples) — skipped")
+            return False
+
+        # ── Cooldown guard ────────────────────────────────────────────────────
+        if (now - self._last_run_ts) < self.COOLDOWN_SECS:
+            print(f"⏳ [STT] Cooldown active — skipping speech_end for call {call_id}")
+            return False
+
+        # ── Skip if previous job still running ───────────────────────────────
+        if self._busy:
+            print(f"⏭️  [STT] Previous transcription still running — skipping")
+            return False
+
+        # ── Snapshot and submit ───────────────────────────────────────────────
+        # Copy the buffer NOW in the RTP thread (cheap) so the pool worker
+        # has its own immutable view; the RTP thread can immediately clear
+        # and reuse _speech_buffer without any race condition.
+        audio_copy = audio_np.copy()
+        self._last_run_ts = now
+        self._busy        = True
+
+        self._pool.submit(self._run, audio_copy, call_id)
+        return True
+
+    def _run(self, audio_np: np.ndarray, call_id: str):
+        """Executed in the ThreadPoolExecutor worker — NOT the RTP thread."""
+        try:
+            duration_sec = len(audio_np) / 16000.0
+
+            # ── Ignore very short segments ─────────────────────────────────────
+            if duration_sec < 1.0:
+                return
+
+            print(f"🎙️  [STT] Transcribing {duration_sec:.2f}s for call [{call_id}]…")
+            t0 = time.perf_counter()
+
+            model = self._load_model()
+
+            # ── Convert int16 PCM → float32 [-1, 1] ────────────────────────────
+            audio_f32 = audio_np.astype(np.float32) / 32768.0
+
+            # ── Run Whisper ────────────────────────────────────────────────────
+            segments, _ = model.transcribe(
+                audio_f32,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                vad_filter=False,
+            )
+
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            elapsed = (time.perf_counter() - t0) * 1000
+
+            # ── Output + UI emission ──────────────────────────────────────────
+            if text:
+                print(f"\n🧠 [STT] [{call_id}] ({elapsed:.0f} ms)")
+                print(f"➡️  {text}\n")
+
+                # 🚀 EMIT TO FRONTEND (FIXED)
+                try:
+                    # IMPORTANT: use global sio, NOT self.sio
+                    sio.emit("transcript", {
+                        "call_id": call_id,
+                        "text": text,
+                        "timestamp": time.time()  # seconds (frontend expects this)
+                    })
+                except Exception as e:
+                    print(f"⚠️  [STT] Emit failed: {e}")
+
+            else:
+                print(f"⚠️  [STT] [{call_id}] Empty transcription ({elapsed:.0f} ms)")
+
+        except Exception as exc:
+            print(f"⚠️  [STT] Error for call [{call_id}]: {exc}")
+
+        finally:
+            # ── Always release busy flag ───────────────────────────────────────
+            self._busy = False
+
+    def shutdown(self):
+        """Graceful shutdown — waits for any in-flight job to finish."""
+        self._pool.shutdown(wait=True)
+
+
+# ── Global STT manager (one instance, shared across all calls) ────────────────
+# Single pool across calls prevents multiple simultaneous Whisper runs even
+# when several SIP calls are active concurrently.
+_stt_manager = STTManager()
 
 
 # ── SIP Signaling Server ──────────────────────────────────────────────────────
@@ -814,6 +994,8 @@ class SIPSignalingServer:
             rs = session.get("rtp_sender")
             if rr:
                 rr.running = False
+                # Clear any buffered speech so the STT pool isn't fed stale data
+                rr._speech_buffer.clear()
                 _free_rtp_port(rr.port)
             if rs:
                 rs.close()
