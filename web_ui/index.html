@@ -35,6 +35,20 @@
   --violet-dim:   rgba(187,136,255,0.10);
   --orange:       #ff7730;
 
+  /* [NEW] LLM palette */
+  --llm-accent:   #7c6bff;           /* indigo-violet — distinct from existing palette */
+  --llm-dim:      rgba(124,107,255,0.12);
+  --llm-glow:     rgba(124,107,255,0.28);
+  --llm-border:   rgba(124,107,255,0.3);
+
+  --positive:     #00e67a;
+  --negative:     #ff3355;
+  --neutral:      #7a8fa0;
+  --mixed:        #ffaa00;
+  --risk-low:     #00e67a;
+  --risk-medium:  #ffaa00;
+  --risk-high:    #ff3355;
+
   --text:         #9ab8c4;
   --text-dim:     #3d5560;
   --text-bright:  #d0eaf0;
@@ -623,6 +637,192 @@ body::after {
 .tx-count { color: var(--phos-mid); }
 
 /* ═══════════════════════════════════════════════════
+   [NEW] LLM REPORT PANEL
+   Sits below the bottom-grid, full-width.
+   Hidden until first llm_report event arrives.
+═══════════════════════════════════════════════════ */
+.llm-section {
+  margin-top: var(--panel-gap);
+}
+
+.llm-panel {
+  background: var(--surface);
+  border: 1px solid var(--llm-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: box-shadow 0.3s ease;
+}
+.llm-panel:not(.hidden) {
+  box-shadow: 0 0 24px var(--llm-glow);
+}
+
+/* Hide utility */
+.hidden { display: none !important; }
+
+/* ── LLM panel header ── */
+.llm-hdr {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--llm-border);
+  background: var(--llm-dim);
+  flex-shrink: 0;
+}
+.llm-hdr-icon {
+  font-size: 0.9rem;
+  color: var(--llm-accent);
+}
+.llm-hdr-title {
+  font-size: 0.6rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--llm-accent);
+  flex: 1;
+}
+.llm-call-id {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+}
+.llm-status-badge {
+  font-size: 0.55rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border2);
+  color: var(--text-dim);
+}
+.llm-status-badge.processing {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: var(--amber-dim);
+  animation: badge-pulse 1.4s ease-in-out infinite;
+}
+.llm-status-badge.complete {
+  border-color: var(--phos);
+  color: var(--phos);
+  background: var(--phos-dim);
+}
+.llm-status-badge.error {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+/* ── LLM body ── */
+.llm-body {
+  padding: 14px 16px 12px;
+}
+
+/* Spinner */
+.llm-spinner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 8px;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+}
+.spinner-ring {
+  width: 18px; height: 18px;
+  border: 2px solid var(--border2);
+  border-top-color: var(--llm-accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Error state */
+.llm-error-msg {
+  font-size: 0.72rem;
+  color: var(--red);
+  padding: 8px 0;
+  letter-spacing: 0.04em;
+  line-height: 1.6;
+}
+
+/* ── Report content layout ── */
+.llm-report-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Two-column sub-row for intent / sentiment / risk */
+.llm-row-2 {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 12px;
+}
+
+.llm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.llm-field-label {
+  font-size: 0.55rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.llm-field-value {
+  font-size: 0.8rem;
+  color: var(--text-bright);
+  line-height: 1.55;
+  letter-spacing: 0.01em;
+}
+.summary-text {
+  font-size: 0.82rem;
+  line-height: 1.65;
+  color: var(--text-bright);
+}
+.action-text {
+  font-size: 0.78rem;
+  color: var(--cyan);
+  line-height: 1.55;
+}
+
+/* Sentiment / Risk level badges */
+.llm-badge {
+  display: inline-block;
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: var(--display);
+  font-weight: 700;
+}
+.sentiment-positive { background: rgba(0,230,122,0.14); color: var(--positive); border: 1px solid rgba(0,230,122,0.3); }
+.sentiment-negative { background: rgba(255,51,85,0.14);  color: var(--negative); border: 1px solid rgba(255,51,85,0.3); }
+.sentiment-neutral  { background: rgba(122,143,160,0.14); color: var(--neutral);  border: 1px solid rgba(122,143,160,0.25); }
+.sentiment-mixed    { background: rgba(255,170,0,0.14);   color: var(--mixed);    border: 1px solid rgba(255,170,0,0.3); }
+
+.risk-low    { background: rgba(0,230,122,0.14);   color: var(--risk-low);    border: 1px solid rgba(0,230,122,0.3); }
+.risk-medium { background: rgba(255,170,0,0.14);   color: var(--risk-medium); border: 1px solid rgba(255,170,0,0.3); }
+.risk-high   { background: rgba(255,51,85,0.14);   color: var(--risk-high);   border: 1px solid rgba(255,51,85,0.3); }
+
+/* ── LLM footer meta ── */
+.llm-meta {
+  font-size: 0.58rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+  padding: 6px 16px 8px;
+  border-top: 1px solid var(--border);
+  text-align: right;
+}
+
+/* ═══════════════════════════════════════════════════
    FOOTER
 ═══════════════════════════════════════════════════ */
 .site-footer {
@@ -847,6 +1047,43 @@ body::after {
       </div>
     </div>
 
+  </div>
+
+  <!-- ══════════════ AI REPORT PANEL (hidden until first llm_report) ══════════════ -->
+  <div class="llm-section">
+    <div class="llm-panel hidden" id="llm-panel">
+
+      <!-- Header row -->
+      <div class="llm-hdr">
+        <span class="llm-hdr-icon">⬡</span>
+        <span class="llm-hdr-title">Post-Call AI Analysis</span>
+        <span class="llm-call-id" id="llm-call-id">—</span>
+        <span class="llm-status-badge" id="llm-status">—</span>
+      </div>
+
+      <!-- Body -->
+      <div class="llm-body" id="llm-body">
+
+        <!-- Spinner (shown while processing) -->
+        <div class="llm-spinner" id="llm-spinner">
+          <div class="spinner-ring"></div>
+          <span>Running LLM analysis — this may take up to 60s on CPU…</span>
+        </div>
+
+        <!-- Error state -->
+        <div class="llm-error-msg hidden" id="llm-error"></div>
+
+        <!-- Structured report (shown when complete) -->
+        <div class="llm-report-content hidden" id="llm-report-content">
+          <!-- Populated dynamically by handleLLMReport() in app.js -->
+        </div>
+
+      </div>
+
+      <!-- Footer meta (elapsed / transcript length) -->
+      <div class="llm-meta" id="llm-meta"></div>
+
+    </div>
   </div>
 
   <!-- ══════════════ FOOTER ══════════════ -->

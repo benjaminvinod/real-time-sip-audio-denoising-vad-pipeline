@@ -41,6 +41,21 @@
   --glow-teal:   0 0 24px rgba(45, 212, 191, 0.18);
   --glow-orange: 0 0 24px rgba(251, 146, 60, 0.18);
   --glow-slate:  0 0 24px rgba(148, 163, 184, 0.12);
+
+  /* ── [NEW] LLM palette ── */
+  --llm:          #7c6bff;
+  --llm-dim:      rgba(124, 107, 255, 0.10);
+  --llm-glow:     0 0 28px rgba(124, 107, 255, 0.22);
+  --llm-border:   rgba(124, 107, 255, 0.28);
+
+  --sentiment-positive: #4ade80;
+  --sentiment-negative: #f87171;
+  --sentiment-neutral:  #94a3b8;
+  --sentiment-mixed:    #fbbf24;
+
+  --risk-low:    #4ade80;
+  --risk-medium: #fbbf24;
+  --risk-high:   #f87171;
 }
 
 /* ── Reset & Base ───────────────────────────────────────────────────────────── */
@@ -605,4 +620,245 @@ body {
   color: var(--text-dim);
   letter-spacing: 0.08em;
   background: rgba(8,11,16,0.9);
+}
+
+
+/* ═════════════════════════════════════════════════════════════════════════════
+   [NEW] LLM REPORT PANEL  — Post-Call AI Analysis
+   Used only by the index.html llm-panel block.
+   All tokens are local so they never conflict with existing variables.
+═════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Hide utility shared with panel ── */
+.hidden { display: none !important; }
+
+/* ── Outer wrapper — adds vertical spacing below the bottom-row ── */
+.llm-section {
+  padding: 0 1.5rem 1.25rem;
+  position: relative;
+  z-index: 2;
+}
+
+/* ── Panel frame ── */
+.llm-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--llm-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  transition: box-shadow 0.35s ease;
+}
+.llm-panel:not(.hidden) {
+  box-shadow: var(--llm-glow);
+}
+
+/* ── Panel header ── */
+.llm-hdr {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.7rem 1.25rem;
+  border-bottom: 1px solid var(--llm-border);
+  background: var(--llm-dim);
+}
+.llm-hdr-icon {
+  font-size: 1rem;
+  color: var(--llm);
+}
+.llm-hdr-title {
+  font-family: var(--font-display);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--llm);
+  flex: 1;
+}
+.llm-call-id {
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  letter-spacing: 0.1em;
+  font-family: var(--font-mono);
+}
+
+/* Status badge */
+.llm-status-badge {
+  font-size: 0.58rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.llm-status-badge.processing {
+  border-color: var(--amber);
+  color: var(--amber);
+  background: rgba(251,191,36,0.10);
+  animation: llm-pulse 1.4s ease-in-out infinite;
+}
+.llm-status-badge.complete {
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(74,222,128,0.08);
+}
+.llm-status-badge.error {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(248,113,113,0.08);
+}
+@keyframes llm-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+/* ── Body ── */
+.llm-body {
+  padding: 1.25rem 1.5rem 1rem;
+}
+
+/* Spinner row */
+.llm-spinner {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  padding: 0.4rem 0 0.6rem;
+}
+.spinner-ring {
+  width: 20px; height: 20px;
+  border: 2px solid rgba(255,255,255,0.08);
+  border-top-color: var(--llm);
+  border-radius: 50%;
+  animation: llm-spin 0.75s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes llm-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Error message */
+.llm-error-msg {
+  font-size: 0.75rem;
+  color: var(--red);
+  line-height: 1.7;
+  letter-spacing: 0.02em;
+  padding: 0.5rem 0 0.6rem;
+}
+
+/* ── Structured report layout ── */
+.llm-report-content {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* 3-column sub-row: intent · sentiment · risk */
+.llm-row-2 {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 1.25rem;
+}
+
+@media (max-width: 900px) {
+  .llm-row-2 { grid-template-columns: 1fr 1fr; }
+}
+
+/* Individual field */
+.llm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.llm-field-label {
+  font-size: 0.58rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+.llm-field-value {
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  line-height: 1.6;
+  letter-spacing: 0.01em;
+}
+
+/* Summary uses slightly larger, softer text */
+.summary-text {
+  font-size: 0.88rem;
+  line-height: 1.7;
+  color: var(--text-primary);
+}
+
+/* Suggested action stands out in cyan */
+.action-text {
+  font-size: 0.82rem;
+  color: var(--cyan);
+  line-height: 1.6;
+}
+
+/* ── Inline badges for sentiment / risk ── */
+.llm-badge {
+  display: inline-block;
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  padding: 3px 10px;
+  border-radius: var(--radius);
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+/* Sentiment */
+.sentiment-positive {
+  background: rgba(74,222,128,0.12);
+  color: var(--sentiment-positive);
+  border: 1px solid rgba(74,222,128,0.28);
+}
+.sentiment-negative {
+  background: rgba(248,113,113,0.12);
+  color: var(--sentiment-negative);
+  border: 1px solid rgba(248,113,113,0.28);
+}
+.sentiment-neutral {
+  background: rgba(148,163,184,0.10);
+  color: var(--sentiment-neutral);
+  border: 1px solid rgba(148,163,184,0.22);
+}
+.sentiment-mixed {
+  background: rgba(251,191,36,0.12);
+  color: var(--sentiment-mixed);
+  border: 1px solid rgba(251,191,36,0.28);
+}
+
+/* Risk level */
+.risk-low {
+  background: rgba(74,222,128,0.12);
+  color: var(--risk-low);
+  border: 1px solid rgba(74,222,128,0.28);
+}
+.risk-medium {
+  background: rgba(251,191,36,0.12);
+  color: var(--risk-medium);
+  border: 1px solid rgba(251,191,36,0.28);
+}
+.risk-high {
+  background: rgba(248,113,113,0.12);
+  color: var(--risk-high);
+  border: 1px solid rgba(248,113,113,0.28);
+}
+
+/* ── Footer meta bar ── */
+.llm-meta {
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.1em;
+  padding: 0.55rem 1.5rem 0.65rem;
+  border-top: 1px solid rgba(255,255,255,0.04);
+  text-align: right;
+  font-family: var(--font-mono);
 }

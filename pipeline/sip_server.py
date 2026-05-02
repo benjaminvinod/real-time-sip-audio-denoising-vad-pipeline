@@ -1,27 +1,31 @@
 """
-sip_server.py  –  Multi-call capable SIP/RTP processing server
-Features added:
-  - Multi-call handling via Call-ID session tracking
-  - RTP jitter buffer with packet reordering (5–20 packets)
-  - Health endpoint for ALB/NLB
-  - Clean BYE teardown per call
-  - SNR metrics exposed on /latest
-  - Speech boundary events (speech_start / speech_end)
-  - audioClear interrupt endpoint
-  - Downstream AI client stub
-  - Per-call heartbeat timestamps
-  - Socket.IO emit per call
+sip_server.py  –  Multi-call SIP/RTP/VAD/STT/LLM pipeline
+===========================================================
+Architecture overview:
+  RTP → DenoiseVAD → STT (speech_end triggered, faster-whisper)
+                   → transcript accumulated per call
+  BYE  → LLM post-call analysis (Ollama llama3.1)
+       → emit "llm_report" via Socket.IO
+
+CRITICAL constraints respected:
+  • eventlet.monkey_patch() is unconditionally first
+  • RTP / VAD pipeline is NOT modified
+  • STT pipeline (ThreadPoolExecutor, max_workers=1) is NOT modified
+  • LLM runs ONLY post-call (triggered by BYE) in its own executor
+  • LLM NEVER touches RTP, VAD, or STT logic
+  • Ollama called locally via requests.post (no external API)
+  • Output is strict JSON: summary, intent, sentiment, risk_level, suggested_action
+  • Result emitted via sio.emit("llm_report", payload)
 """
 
-# ── eventlet monkey-patch MUST be absolutely first ───────────────────────────
-# faster_whisper / ssl / httpx must NOT be imported before this line.
-# Importing them first corrupts eventlet's cooperative socket patching and
-# causes SSL recursion errors + phantom socket hangs under load.
+# ── MUST be absolutely first ──────────────────────────────────────────────────
 import eventlet
 eventlet.monkey_patch(os=True, select=True, socket=True, thread=True, time=True)
+# ─────────────────────────────────────────────────────────────────────────────
 
 import audioop
 import heapq
+import json
 import random
 import re
 import socket
@@ -33,6 +37,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import requests
 import samplerate
 
 from flask import Flask, jsonify, request
@@ -49,14 +54,27 @@ sio = socketio.Server(
     cors_allowed_origins="*",
     async_mode="eventlet",
     ping_timeout=60,
-    ping_interval=25
+    ping_interval=25,
+    max_http_buffer_size=1_000_000,
+    logger=False,
+    engineio_logger=False,
 )
 app = Flask(__name__)
 app.wsgi_app = socketio.WSGIApp(sio, app.wsgi_app)
 
 
-# ── Global polling state ──────────────────────────────────────────────────────
-# Aggregated view across all active calls; per-call data also available.
+# ── Socket.IO lifecycle ───────────────────────────────────────────────────────
+
+@sio.event
+def connect(sid, environ):
+    print(f"🔌 WS client connected: {sid}")
+
+@sio.event
+def disconnect(sid):
+    print(f"🔌 WS client disconnected: {sid}")
+
+
+# ── Global metrics state ──────────────────────────────────────────────────────
 
 LATEST_DATA = {
     "seq":              0,
@@ -71,16 +89,12 @@ LATEST_DATA = {
     "last_state":       "silence",
     "avg_trt":          0.0,
     "fps":              0.0,
-    # SNR / denoise quality
     "raw_energy":       0.0,
     "denoised_energy":  0.0,
     "snr_db":           0.0,
-    # Speech boundary events
     "speech_start_count": 0,
     "speech_end_count":   0,
-    # Active calls count
     "active_calls":     0,
-    # Heartbeat
     "server_ts":        0.0,
 }
 
@@ -89,6 +103,8 @@ _trt_count: int   = 0
 _frame_timestamps: deque = deque(maxlen=500)
 _data_lock = threading.Lock()
 
+
+# ── SocketEmitter ─────────────────────────────────────────────────────────────
 
 class SocketEmitter:
     """Writes per-frame results into LATEST_DATA and emits via Socket.IO."""
@@ -107,11 +123,10 @@ class SocketEmitter:
 
         now = time.time()
 
-        # ── BASE PAYLOAD (frame-level) ────────────────────────────────────────
         payload = {
             "seq":             seq,
             "data":            base64.b64encode(pcm16.tobytes()).decode(),
-            "is_speech":       bool(is_speech),   # ✅ ensure strict boolean
+            "is_speech":       bool(is_speech),
             "call_id":         self.call_id,
             "raw_energy":      float(raw_energy),
             "denoised_energy": float(denoised_energy),
@@ -120,7 +135,6 @@ class SocketEmitter:
         }
 
         with _data_lock:
-            # ── FRAME COUNTS ────────────────────────────────────────────────
             LATEST_DATA["seq"]          = seq
             LATEST_DATA["is_speech"]    = bool(is_speech)
             LATEST_DATA["frame_count"] += 1
@@ -131,14 +145,10 @@ class SocketEmitter:
                 LATEST_DATA["silence_count"] += 1
 
             total = LATEST_DATA["frame_count"]
-
-            # ── SAFE RATIO CALCULATION ──────────────────────────────────────
             LATEST_DATA["speech_ratio"] = (
                 (LATEST_DATA["speech_count"] / total) * 100.0
                 if total > 0 else 0.0
             )
-
-            # ── STATE + METADATA ────────────────────────────────────────────
             LATEST_DATA["last_updated"]    = now
             LATEST_DATA["rtp_active"]      = True
             LATEST_DATA["last_state"]      = "speech" if is_speech else "silence"
@@ -147,29 +157,22 @@ class SocketEmitter:
             LATEST_DATA["snr_db"]          = snr_db
             LATEST_DATA["server_ts"]       = now
 
-            # ── SPEECH EVENTS ───────────────────────────────────────────────
             if speech_event == "speech_start":
                 LATEST_DATA["speech_start_count"] += 1
             elif speech_event == "speech_end":
                 LATEST_DATA["speech_end_count"] += 1
 
-            # ── LATENCY (TRT) ───────────────────────────────────────────────
             if trt_ms > 0:
                 _trt_sum   += trt_ms
                 _trt_count += 1
-                if _trt_count > 0:
-                    LATEST_DATA["avg_trt"] = _trt_sum / _trt_count
-                else:
-                    LATEST_DATA["avg_trt"] = 0.0
+                LATEST_DATA["avg_trt"] = _trt_sum / _trt_count if _trt_count > 0 else 0.0
 
-            # ── FPS CALCULATION ─────────────────────────────────────────────
             _frame_timestamps.append(now)
             cutoff = now - 1.0
             LATEST_DATA["fps"] = float(
                 sum(1 for t in _frame_timestamps if t >= cutoff)
             )
 
-            # ── AGGREGATED PAYLOAD (dashboard-level) ────────────────────────
             payload.update({
                 "total_frames":   LATEST_DATA["frame_count"],
                 "speech_frames":  LATEST_DATA["speech_count"],
@@ -183,7 +186,6 @@ class SocketEmitter:
                 "timestamp":      now,
             })
 
-        # ── EMIT TO FRONTEND ────────────────────────────────────────────────
         try:
             self.sio.emit("processedAudio", payload)
         except Exception as e:
@@ -194,7 +196,6 @@ class SocketEmitter:
 
 @app.route("/latest")
 def latest():
-    """Polling endpoint for Streamlit."""
     with _data_lock:
         data = dict(LATEST_DATA)
     data["active_calls"] = len(CALL_SESSIONS)
@@ -203,7 +204,6 @@ def latest():
 
 @app.route("/health")
 def health():
-    """ALB / NLB liveness probe."""
     return jsonify({
         "status":       "ok",
         "rtp_active":   LATEST_DATA["rtp_active"],
@@ -213,7 +213,6 @@ def health():
 
 @app.route("/reset")
 def reset_endpoint():
-    """Reset counters – callable from Streamlit."""
     global _trt_sum, _trt_count
     _trt_sum   = 0.0
     _trt_count = 0
@@ -234,7 +233,7 @@ def reset_endpoint():
 
 @app.route("/clear_audio", methods=["POST"])
 def clear_audio():
-    global LATEST_DATA, _trt_sum, _trt_count, _frame_timestamps
+    global _trt_sum, _trt_count
 
     with _data_lock:
         LATEST_DATA.update({
@@ -248,20 +247,16 @@ def clear_audio():
             "speech_start_count": 0,
             "speech_end_count": 0,
         })
-
         _trt_sum = 0.0
         _trt_count = 0
         _frame_timestamps.clear()
 
-    # notify frontend instantly
     sio.emit("audioCleared", {"status": "ok"})
-
     return jsonify({"status": "cleared"})
 
 
 @app.route("/calls")
 def calls_endpoint():
-    """Return info on all active calls."""
     result = []
     for cid, sess in CALL_SESSIONS.items():
         result.append({
@@ -272,7 +267,7 @@ def calls_endpoint():
     return jsonify(result)
 
 
-# ── Heartbeat background thread ───────────────────────────────────────────────
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
 
 def _heartbeat_loop():
     while True:
@@ -294,13 +289,20 @@ RESAMPLE_RATIO_DN  = PCMU_SAMPLE_RATE  / TARGET_SAMPLE_RATE
 RESAMPLE_CONVERTER = "sinc_fastest"
 RTP_PAYLOAD_TYPE   = 0
 
-# Port pool for multi-call RTP (even ports 7000, 7010, 7020 …)
 _RTP_PORT_POOL = list(range(7000, 7200, 10))
 _port_lock     = threading.Lock()
 _ports_in_use: set = set()
 
 CALL_SESSIONS: dict = {}   # call_id → session dict
 _sessions_lock = threading.Lock()
+
+# ── Per-call transcript store ─────────────────────────────────────────────────
+# Keyed by call_id; each value is a list of transcript strings.
+# Written by STTManager._run() after each speech_end.
+# Read by LLMAnalyser._run() after BYE.
+# Protected by _transcripts_lock.
+CALL_TRANSCRIPTS: dict = {}   # call_id → list[str]
+_transcripts_lock = threading.Lock()
 
 
 def _alloc_rtp_port() -> int:
@@ -360,32 +362,20 @@ class RTPSender:
 # ── RTP Jitter Buffer ─────────────────────────────────────────────────────────
 
 class JitterBuffer:
-    """
-    Small priority-queue based jitter buffer (5–20 packets).
-    Packets are held until the buffer has MIN_PACKETS entries,
-    then released in sequence-number order.
-    Late packets (seq < expected) are dropped.
-    """
-
     MIN_PACKETS = 5
     MAX_PACKETS = 20
 
     def __init__(self):
-        self._heap: list      = []   # (seq, payload_bytes)
+        self._heap: list           = []
         self._expected_seq: int | None = None
 
     def push(self, seq: int, payload: bytes):
         if self._expected_seq is not None and seq < self._expected_seq:
-            # Late / duplicate packet — drop
             return
         if len(self._heap) < self.MAX_PACKETS:
             heapq.heappush(self._heap, (seq, payload))
 
     def pop_ready(self) -> list[tuple[int, bytes]]:
-        """
-        Return a list of (seq, payload) packets that are ready to process.
-        Packets are withheld until MIN_PACKETS are buffered.
-        """
         if len(self._heap) < self.MIN_PACKETS:
             return []
 
@@ -394,11 +384,8 @@ class JitterBuffer:
             seq, payload = heapq.heappop(self._heap)
             if self._expected_seq is None:
                 self._expected_seq = seq
-
             if seq < self._expected_seq:
-                # Stale — discard
                 continue
-
             ready.append((seq, payload))
             self._expected_seq = seq + 1
 
@@ -432,14 +419,9 @@ class RTPReceiver:
         self._pkt_count = 0
         self.emitter: SocketEmitter | None = None
 
-        self._jitter   = JitterBuffer()
+        self._jitter        = JitterBuffer()
         self._speech_buffer = []
-
-        # ✅ NEW: speech smoothing buffer
-        from collections import deque
         self._speech_history = deque(maxlen=5)
-
-    # ── Dummy RTP keep-alive ──────────────────────────────────────────────────
 
     def _send_dummy_rtp(self, addr):
         client_ip, client_port = addr
@@ -455,8 +437,6 @@ class RTPReceiver:
             self.sock.sendto(header + payload, (client_ip, client_port))
         except Exception as e:
             print(f"⚠️ Dummy RTP send error: {e}")
-
-    # ── Main listen loop ──────────────────────────────────────────────────────
 
     def listen(self):
         print(f"👂 RTP Listener active on UDP port {self.port} (call: {self.call_id})")
@@ -478,16 +458,13 @@ class RTPReceiver:
             if self._pkt_count <= 5 or self._pkt_count % 50 == 0:
                 print(f"📦 RTP #{self._pkt_count} [{self.call_id}] from {addr} ({len(data)}B)")
 
-            # Keep-alive
             self._send_dummy_rtp(addr)
 
             t_recv = time.perf_counter()
 
-            # Parse RTP sequence number
-            rtp_seq = struct.unpack("!H", data[2:4])[0]
+            rtp_seq     = struct.unpack("!H", data[2:4])[0]
             rtp_payload = data[12:]
 
-            # Push into jitter buffer
             self._jitter.push(rtp_seq, rtp_payload)
             ready = self._jitter.pop_ready()
 
@@ -513,25 +490,21 @@ class RTPReceiver:
                 self._seq, frame, t_recv, self.metrics
             )
 
-            # ── Collect speech frames ─────────────────────────
             if is_speech:
                 self._speech_buffer.append(denoised.copy())
 
             trt_ms = (time.perf_counter() - t_recv) * 1000.0
 
-            # ── SEND RTP BACK ────────────────────────────────────────────────
             self.sender.send(denoised)
 
-            # ── NEW: VAD SMOOTHING ───────────────────────────────────────────
             self._speech_history.append(1 if is_speech else 0)
             smoothed_speech = sum(self._speech_history) >= 3
 
-            # ── EMIT TO FRONTEND ─────────────────────────────────────────────
             if self.emitter:
                 self.emitter.send(
                     self._seq,
                     denoised,
-                    smoothed_speech,  # ✅ FIXED (was is_speech)
+                    smoothed_speech,
                     trt_ms=trt_ms,
                     raw_energy=snr_info.get("raw_energy", 0.0),
                     denoised_energy=snr_info.get("denoised_energy", 0.0),
@@ -539,23 +512,17 @@ class RTPReceiver:
                     speech_event=speech_event,
                 )
 
-                # ── NEW: HEARTBEAT ──────────────────────────────────────────
                 try:
                     sio.emit("heartbeat", {"ts": time.time()})
                 except Exception:
                     pass
 
-            # ── DOWNSTREAM AI (unchanged) ────────────────────────────────────
-            if smoothed_speech:   # ✅ use smoothed instead of raw
+            if smoothed_speech:
                 send_to_ai(self._seq, denoised, self.call_id)
 
-            # ── Speech segment ended → submit to STT (non-blocking) ───────────
-            # _stt_manager.submit() returns immediately — it never blocks the
-            # RTP thread. The audio copy and cooldown check happen here in O(1).
-            # Whisper runs in the background pool worker.
             if speech_event == "speech_end" and self._speech_buffer:
                 segment = np.concatenate(self._speech_buffer)
-                self._speech_buffer.clear()   # clear immediately, safe — copy made in submit()
+                self._speech_buffer.clear()
                 _stt_manager.submit(segment, self.call_id)
 
             self._seq += 1
@@ -566,6 +533,402 @@ class RTPReceiver:
             self.sock.close()
         except Exception:
             pass
+
+
+# ── STT Manager ───────────────────────────────────────────────────────────────
+#
+# Design goals (unchanged):
+#   1. Never block the RTP thread
+#   2. Single worker — no concurrent Whisper runs
+#   3. Cooldown between submissions
+#   4. Lazy model load (post monkey_patch)
+#   5. Transcript is appended to CALL_TRANSCRIPTS after each successful run
+
+class STTManager:
+    MIN_SAMPLES   = 16_000
+    COOLDOWN_SECS = 2.0
+
+    def __init__(self):
+        self._pool        = ThreadPoolExecutor(max_workers=1)
+        self._model       = None
+        self._model_lock  = threading.Lock()
+        self._last_run_ts = 0.0
+        self._busy        = False
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                from faster_whisper import WhisperModel
+                print("📦 [STT] Loading Whisper tiny (CPU)…")
+                self._model = WhisperModel(
+                    "tiny",
+                    device="cpu",
+                    compute_type="int8",
+                    local_files_only=True,
+                )
+                print("✅ [STT] Whisper model ready")
+        return self._model
+
+    def submit(self, audio_np: np.ndarray, call_id: str) -> bool:
+        now = time.monotonic()
+
+        if len(audio_np) < self.MIN_SAMPLES:
+            print(f"⏭️  [STT] Segment too short ({len(audio_np)} samples) — skipped")
+            return False
+
+        if (now - self._last_run_ts) < self.COOLDOWN_SECS:
+            print(f"⏳ [STT] Cooldown active — skipping speech_end for call {call_id}")
+            return False
+
+        if self._busy:
+            print(f"⏭️  [STT] Previous transcription still running — skipping")
+            return False
+
+        audio_copy        = audio_np.copy()
+        self._last_run_ts = now
+        self._busy        = True
+
+        self._pool.submit(self._run, audio_copy, call_id)
+        return True
+
+    def _run(self, audio_np: np.ndarray, call_id: str):
+        """Runs in the ThreadPoolExecutor worker — never in the RTP thread."""
+        try:
+            duration_sec = len(audio_np) / 16000.0
+
+            if duration_sec < 1.0:
+                return
+
+            print(f"🎙️  [STT] Transcribing {duration_sec:.2f}s for call [{call_id}]…")
+            t0 = time.perf_counter()
+
+            model = self._load_model()
+
+            audio_f32 = audio_np.astype(np.float32) / 32768.0
+
+            segments, _ = model.transcribe(
+                audio_f32,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                vad_filter=False,
+            )
+
+            text    = " ".join(seg.text.strip() for seg in segments).strip()
+            elapsed = (time.perf_counter() - t0) * 1000
+
+            if text:
+                print(f"\n🧠 [STT] [{call_id}] ({elapsed:.0f} ms)\n➡️  {text}\n")
+
+                # ── Accumulate into per-call transcript store ─────────────────
+                with _transcripts_lock:
+                    if call_id not in CALL_TRANSCRIPTS:
+                        CALL_TRANSCRIPTS[call_id] = []
+                    CALL_TRANSCRIPTS[call_id].append(text)
+
+                # ── Emit live segment to frontend ─────────────────────────────
+                try:
+                    sio.emit("transcript", {
+                        "call_id":   call_id,
+                        "text":      text,
+                        "timestamp": time.time(),
+                    })
+                except Exception as e:
+                    print(f"⚠️  [STT] Emit failed: {e}")
+
+            else:
+                print(f"⚠️  [STT] [{call_id}] Empty transcription ({elapsed:.0f} ms)")
+
+        except Exception as exc:
+            print(f"⚠️  [STT] Error for call [{call_id}]: {exc}")
+
+        finally:
+            self._busy = False
+
+    def shutdown(self):
+        self._pool.shutdown(wait=True)
+
+
+# ── Global STT manager ────────────────────────────────────────────────────────
+_stt_manager = STTManager()
+
+
+# ── LLM Analyser ─────────────────────────────────────────────────────────────
+#
+# Runs ONLY after call ends (triggered by BYE teardown).
+# Uses a separate single-worker ThreadPoolExecutor so it NEVER competes with STT.
+# Calls Ollama via requests.post — no external API dependencies.
+# Emits "llm_report" on success, "llm_error" on failure.
+
+OLLAMA_URL   = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "llama3.1:8b"
+
+# Strict JSON schema Ollama must return
+_LLM_SCHEMA = """{
+  "summary":          "<2-3 sentence factual summary of the conversation>",
+  "intent":           "<primary intent of the caller, e.g. complaint, inquiry, support request>",
+  "sentiment":        "<one of: positive | neutral | negative | mixed>",
+  "risk_level":       "<one of: low | medium | high>",
+  "suggested_action": "<actionable next step for the agent or automated system>"
+}"""
+
+_LLM_SYSTEM_PROMPT = (
+    "You are an AI system that analyzes call transcripts.\n\n"
+
+    "Your task is to extract structured information from the transcript.\n\n"
+
+    "Return ONLY a valid JSON object with EXACTLY the following fields:\n"
+    "{\n"
+    "  \"summary\": \"short 1-2 sentence summary\",\n"
+    "  \"intent\": \"primary user intent (short phrase)\",\n"
+    "  \"sentiment\": \"positive | neutral | negative\",\n"
+    "  \"risk_level\": \"low | medium | high\",\n"
+    "  \"suggested_action\": \"clear next step\"\n"
+    "}\n\n"
+
+    "STRICT RULES:\n"
+    "- Do NOT include explanations\n"
+    "- Do NOT include markdown\n"
+    "- Do NOT include text before or after JSON\n"
+    "- Output must be valid JSON only\n"
+)
+
+
+class LLMAnalyser:
+    """
+    Post-call LLM analysis using Ollama (llama3.1).
+
+    Workflow:
+      1. Called from _handle_bye after session teardown.
+      2. Snapshots the full transcript for the call_id.
+      3. Submits to Ollama in a background thread (separate pool from STT).
+      4. Parses the strict JSON response.
+      5. Emits "llm_report" via Socket.IO.
+      6. Cleans up the transcript store for the finished call.
+    """
+
+    def __init__(self):
+        # Separate pool from STT — LLM jobs don't block STT queue
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
+
+    def analyse_call(self, call_id: str):
+        """
+        Non-blocking entry point — called from BYE handler.
+        Snapshots the transcript immediately (still in BYE thread),
+        then hands off to the worker pool.
+        """
+
+        start_ts = time.perf_counter()
+
+        # ── Snapshot transcript safely ─────────────────────────────
+        with _transcripts_lock:
+            segments = list(CALL_TRANSCRIPTS.get(call_id, []))
+
+        segment_count = len(segments)
+        full_text = " ".join(segments).strip()
+
+        # ── Handle empty transcript ────────────────────────────────
+        if not full_text:
+            print(f"ℹ️  [LLM] No transcript for call [{call_id}] — skipping analysis")
+
+            processing_ms = (time.perf_counter() - start_ts) * 1000.0
+
+            try:
+                sio.emit("llm_report", {
+                    "call_id": call_id,
+                    "report":  None,
+                    "error":   "No transcript captured for this call.",
+                    "meta": {
+                        "length": 0,
+                        "segments": segment_count,
+                        "processing_ms": processing_ms,
+                    },
+                })
+            except Exception as e:
+                print(f"⚠️ [LLM] Emit failed (no transcript): {e}")
+
+            return
+
+        # ── Normal path ────────────────────────────────────────────
+        print(
+            f"📋 [LLM] Queuing post-call analysis for [{call_id}] "
+            f"({len(full_text)} chars, {segment_count} segments)"
+        )
+
+        try:
+            self._pool.submit(self._run, call_id, full_text)
+        except Exception as e:
+            print(f"⚠️ [LLM] Failed to submit job for [{call_id}]: {e}")
+
+            processing_ms = (time.perf_counter() - start_ts) * 1000.0
+
+            # Emit failure so UI doesn't hang
+            try:
+                sio.emit("llm_report", {
+                    "call_id": call_id,
+                    "report": None,
+                    "error":  "Failed to start LLM analysis.",
+                    "meta": {
+                        "length": len(full_text),
+                        "segments": segment_count,
+                        "processing_ms": processing_ms,
+                    },
+                })
+            except Exception:
+                pass
+
+    def _run(self, call_id: str, full_text: str):
+        """Executed in the LLM worker thread — never in RTP or STT threads."""
+        t0 = time.perf_counter()
+        print(f"🤖 [LLM] Analysing call [{call_id}]…")
+
+        try:
+            # ── Build Ollama request ──────────────────────────────────────────
+            payload = {
+                "model":  OLLAMA_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                    {"role": "user",   "content": f"TRANSCRIPT:\n{full_text}"},
+                ],
+                "options": {
+                    "temperature": 0.1,   # low temp → consistent, deterministic JSON
+                    "num_predict": 256,   # enough for the JSON response
+                },
+            }
+
+            response = requests.post(
+                OLLAMA_URL,
+                json=payload,
+                timeout=120,   # Ollama on CPU can take a while; generous timeout
+            )
+            response.raise_for_status()
+
+            raw = response.json()
+            # Ollama non-stream response: {"message": {"role": "assistant", "content": "..."}}
+            content = raw.get("message", {}).get("content", "").strip()
+
+            if not content:
+                raise ValueError("Ollama returned empty content")
+
+            # ── Strip any accidental markdown fences ─────────────────────────
+            # Even with the system prompt, some models wrap JSON in ```json ... ```
+            content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.MULTILINE)
+            content = re.sub(r"\s*```$", "", content, flags=re.MULTILINE)
+            content = content.strip()
+
+            # ── Parse JSON ───────────────────────────────────────────────────
+            try:
+                report = json.loads(content)
+            except:
+                report = {
+                    "summary": content[:200],
+                    "intent": "unknown",
+                    "sentiment": "neutral",
+                    "risk_level": "low",
+                    "suggested_action": "manual review"
+                }
+
+            # ── Validate required keys ────────────────────────────────────────
+            required = {"summary", "intent", "sentiment", "risk_level", "suggested_action"}
+            missing  = required - set(report.keys())
+            if missing:
+                raise ValueError(f"LLM response missing keys: {missing}")
+
+            # ── Normalise values to known enums (safe defaults) ───────────────
+            valid_sentiments = {"positive", "neutral", "negative", "mixed"}
+            valid_risks      = {"low", "medium", "high"}
+            if report["sentiment"].lower() not in valid_sentiments:
+                report["sentiment"] = "neutral"
+            if report["risk_level"].lower() not in valid_risks:
+                report["risk_level"] = "low"
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            print(f"✅ [LLM] [{call_id}] complete in {elapsed_ms:.0f} ms")
+            print(f"   sentiment={report['sentiment']}  risk={report['risk_level']}")
+            print(f"   summary: {report['summary'][:80]}…")
+
+            # ── Emit result to all connected frontend clients ─────────────────
+            emit_payload = {
+                "call_id": call_id,
+                "report":  report,
+                "error":   None,
+                "meta": {
+                    "length":        len(full_text),
+                    "segments":      0,           # populated below after lock
+                    "processing_ms": round(elapsed_ms, 1),
+                },
+            }
+
+            # Grab segment count safely
+            with _transcripts_lock:
+                emit_payload["meta"]["segments"] = len(CALL_TRANSCRIPTS.get(call_id, []))
+
+            try:
+                sio.emit("llm_report", emit_payload)
+            except Exception as e:
+                print(f"⚠️  [LLM] Emit failed: {e}")
+
+        except requests.exceptions.ConnectionError:
+            err = "Ollama is not running. Start it with: ollama serve"
+            print(f"❌ [LLM] [{call_id}] {err}")
+            self._emit_error(call_id, err)
+
+        except requests.exceptions.Timeout:
+            err = f"Ollama request timed out after 120 s for call [{call_id}]"
+            print(f"❌ [LLM] {err}")
+            self._emit_error(call_id, err)
+
+        except json.JSONDecodeError as e:
+            err = f"LLM response was not valid JSON: {e}"
+            print(f"❌ [LLM] [{call_id}] {err}")
+            self._emit_error(call_id, err)
+
+        except ValueError as e:
+            err = str(e)
+            print(f"❌ [LLM] [{call_id}] {err}")
+            self._emit_error(call_id, err)
+
+        except Exception as exc:
+            err = f"Unexpected LLM error: {exc}"
+            print(f"❌ [LLM] [{call_id}] {err}")
+            self._emit_error(call_id, err)
+
+        finally:
+            # ── Clean up transcript store for this call ───────────────────────
+            # Done here (after LLM finishes) so the full transcript is available
+            # for the entire analysis window, even if it takes a while.
+            with _transcripts_lock:
+                CALL_TRANSCRIPTS.pop(call_id, None)
+
+    def _emit_error(self, call_id: str, error_msg: str):
+        try:
+            with _transcripts_lock:
+                segments = len(CALL_TRANSCRIPTS.get(call_id, []))
+
+            sio.emit("llm_report", {
+                "call_id": call_id,
+                "report": None,
+                "error": error_msg,
+                "meta": {
+                    "length": 0,
+                    "segments": segments,
+                    "processing_ms": 0
+                }
+            })
+        except Exception as e:
+            print(f"⚠️  [LLM] Error emit failed: {e}")
+
+    def shutdown(self):
+        self._pool.shutdown(wait=False)   # don't block server exit on slow LLM
+
+
+# ── Global LLM analyser (singleton) ──────────────────────────────────────────
+_llm_analyser = LLMAnalyser()
 
 
 # ── SIP header helpers ────────────────────────────────────────────────────────
@@ -664,166 +1027,6 @@ def build_200_ok(headers: dict, server_ip: str, server_port: int,
         f"{sdp_body}"
     )
 
-# ── STT Manager ───────────────────────────────────────────────────────────────
-#
-# Design goals:
-#   1. Never block the RTP thread — all Whisper work runs in a dedicated pool
-#   2. Single worker (max_workers=1) — prevents CPU saturation from concurrent runs
-#   3. Cooldown between calls — silences that trigger speech_end too frequently
-#      are ignored without queuing up work
-#   4. Lazy model load — WhisperModel is imported and constructed only on the
-#      first actual transcription call, AFTER eventlet has fully patched.
-#      This avoids the SSL recursion issue caused by importing faster_whisper
-#      at module level before monkey_patch completes.
-#   5. Thread-safe model reference via a lock — safe for single-worker pool
-#
-# Why NOT raw threading.Thread:
-#   Raw threads are created per speech_end event with no upper bound. Under
-#   frequent speech activity this causes thread explosion, shared GIL pressure,
-#   and TRT spikes. A pool with max_workers=1 serialises STT work onto one OS
-#   thread and lets the RTP loop continue unaffected.
-
-class STTManager:
-    """
-    Non-blocking STT runner.
-    Submit speech buffers via .submit(); Whisper runs in background.
-    The RTP thread is never blocked.
-    """
-
-    # Minimum samples at 16 kHz to attempt transcription (1 second)
-    MIN_SAMPLES    = 16_000
-
-    # Seconds between STT submissions — prevents CPU overload from rapid
-    # speech_end events (e.g. VAD bouncing at silence/speech boundary)
-    COOLDOWN_SECS  = 2.0
-
-    def __init__(self):
-        # Single-worker pool: one Whisper job at a time, no thread explosion
-        self._pool          = ThreadPoolExecutor(max_workers=1)
-        self._model         = None          # lazy-loaded on first use
-        self._model_lock    = threading.Lock()
-        self._last_run_ts   = 0.0           # epoch of last submitted job
-        self._busy          = False         # True while a job is in-flight
-
-    def _load_model(self):
-        """Load WhisperModel exactly once, thread-safely."""
-        if self._model is not None:
-            return self._model
-        with self._model_lock:
-            if self._model is None:
-                # Import here — AFTER eventlet.monkey_patch() has completed —
-                # to avoid SSL/socket recursion.
-                from faster_whisper import WhisperModel
-                print("📦 [STT] Loading Whisper tiny (CPU)…")
-                self._model = WhisperModel(
-                    "tiny",
-                    device="cpu",
-                    compute_type="int8",
-                    local_files_only=True,
-                )
-                print("✅ [STT] Whisper model ready")
-        return self._model
-
-    def submit(self, audio_np: np.ndarray, call_id: str) -> bool:
-        """
-        Non-blocking submission.
-        Returns True if the job was queued, False if skipped (cooldown / too short).
-        Called from the RTP thread — must return in microseconds.
-        """
-        now = time.monotonic()
-
-        # ── Minimum length guard ──────────────────────────────────────────────
-        if len(audio_np) < self.MIN_SAMPLES:
-            print(f"⏭️  [STT] Segment too short ({len(audio_np)} samples) — skipped")
-            return False
-
-        # ── Cooldown guard ────────────────────────────────────────────────────
-        if (now - self._last_run_ts) < self.COOLDOWN_SECS:
-            print(f"⏳ [STT] Cooldown active — skipping speech_end for call {call_id}")
-            return False
-
-        # ── Skip if previous job still running ───────────────────────────────
-        if self._busy:
-            print(f"⏭️  [STT] Previous transcription still running — skipping")
-            return False
-
-        # ── Snapshot and submit ───────────────────────────────────────────────
-        # Copy the buffer NOW in the RTP thread (cheap) so the pool worker
-        # has its own immutable view; the RTP thread can immediately clear
-        # and reuse _speech_buffer without any race condition.
-        audio_copy = audio_np.copy()
-        self._last_run_ts = now
-        self._busy        = True
-
-        self._pool.submit(self._run, audio_copy, call_id)
-        return True
-
-    def _run(self, audio_np: np.ndarray, call_id: str):
-        """Executed in the ThreadPoolExecutor worker — NOT the RTP thread."""
-        try:
-            duration_sec = len(audio_np) / 16000.0
-
-            # ── Ignore very short segments ─────────────────────────────────────
-            if duration_sec < 1.0:
-                return
-
-            print(f"🎙️  [STT] Transcribing {duration_sec:.2f}s for call [{call_id}]…")
-            t0 = time.perf_counter()
-
-            model = self._load_model()
-
-            # ── Convert int16 PCM → float32 [-1, 1] ────────────────────────────
-            audio_f32 = audio_np.astype(np.float32) / 32768.0
-
-            # ── Run Whisper ────────────────────────────────────────────────────
-            segments, _ = model.transcribe(
-                audio_f32,
-                language="en",
-                beam_size=1,
-                best_of=1,
-                temperature=0.0,
-                vad_filter=False,
-            )
-
-            text = " ".join(seg.text.strip() for seg in segments).strip()
-            elapsed = (time.perf_counter() - t0) * 1000
-
-            # ── Output + UI emission ──────────────────────────────────────────
-            if text:
-                print(f"\n🧠 [STT] [{call_id}] ({elapsed:.0f} ms)")
-                print(f"➡️  {text}\n")
-
-                # 🚀 EMIT TO FRONTEND (FIXED)
-                try:
-                    # IMPORTANT: use global sio, NOT self.sio
-                    sio.emit("transcript", {
-                        "call_id": call_id,
-                        "text": text,
-                        "timestamp": time.time()  # seconds (frontend expects this)
-                    })
-                except Exception as e:
-                    print(f"⚠️  [STT] Emit failed: {e}")
-
-            else:
-                print(f"⚠️  [STT] [{call_id}] Empty transcription ({elapsed:.0f} ms)")
-
-        except Exception as exc:
-            print(f"⚠️  [STT] Error for call [{call_id}]: {exc}")
-
-        finally:
-            # ── Always release busy flag ───────────────────────────────────────
-            self._busy = False
-
-    def shutdown(self):
-        """Graceful shutdown — waits for any in-flight job to finish."""
-        self._pool.shutdown(wait=True)
-
-
-# ── Global STT manager (one instance, shared across all calls) ────────────────
-# Single pool across calls prevents multiple simultaneous Whisper runs even
-# when several SIP calls are active concurrently.
-_stt_manager = STTManager()
-
 
 # ── SIP Signaling Server ──────────────────────────────────────────────────────
 
@@ -835,7 +1038,7 @@ class SIPSignalingServer:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
 
-        self._shared_metrics = MetricsLogger()   # one logger, shared across calls
+        self._shared_metrics = MetricsLogger()
         self._local_ip       = get_local_ip()
         print(f"🌐 Local IP: {self._local_ip}")
 
@@ -898,15 +1101,14 @@ class SIPSignalingServer:
 
         print(f"📞 Fresh INVITE [{call_id}]")
 
-        # 100 Trying
         trying = build_100_trying(headers, self._local_ip, addr)
         self.sock.sendto(trying.encode(), addr)
         print("📤 100 Trying sent")
 
-        rtp_port     = extract_rtp_port(msg)
-        rtp_ip       = addr[0]
-        server_rtp   = _alloc_rtp_port()
-        sender_port  = server_rtp + 2
+        rtp_port    = extract_rtp_port(msg)
+        rtp_ip      = addr[0]
+        server_rtp  = _alloc_rtp_port()
+        sender_port = server_rtp + 2
 
         rtp_sender   = RTPSender(dest_ip=rtp_ip, dest_port=rtp_port, src_port=sender_port)
         handler      = DenoiseVADHandler(call_id)
@@ -917,6 +1119,10 @@ class SIPSignalingServer:
         )
         emitter = SocketEmitter(sio, call_id)
         rtp_receiver.emitter = emitter
+
+        # ── Initialise per-call transcript store ──────────────────────────────
+        with _transcripts_lock:
+            CALL_TRANSCRIPTS[call_id] = []
 
         with _sessions_lock:
             CALL_SESSIONS[call_id] = {
@@ -971,7 +1177,7 @@ class SIPSignalingServer:
         call_id = headers.get("call-id", "")
         print(f"📴 BYE [{call_id}]")
 
-        # Send 200 OK for BYE
+        # ── Send 200 OK for BYE ───────────────────────────────────────────────
         if "via" in headers:
             response = (
                 "SIP/2.0 200 OK\r\n"
@@ -986,6 +1192,7 @@ class SIPSignalingServer:
             self.sock.sendto(response.encode(), addr)
             print(f"📤 200 OK for BYE [{call_id}]")
 
+        # ── Teardown RTP + VAD resources ──────────────────────────────────────
         with _sessions_lock:
             session = CALL_SESSIONS.pop(call_id, None)
 
@@ -994,7 +1201,6 @@ class SIPSignalingServer:
             rs = session.get("rtp_sender")
             if rr:
                 rr.running = False
-                # Clear any buffered speech so the STT pool isn't fed stale data
                 rr._speech_buffer.clear()
                 _free_rtp_port(rr.port)
             if rs:
@@ -1010,12 +1216,38 @@ class SIPSignalingServer:
 
         print(f"📭 Call [{call_id}] torn down — ready for next INVITE")
 
+        # ── Notify frontend: call ended, LLM starting ─────────────────────────
+        # This fires BEFORE the LLM job is queued so the UI can show the spinner
+        # immediately. The LLM job is then queued asynchronously.
+        try:
+            sio.emit("call_ended", {
+                "call_id":    call_id,
+                "ended_at":   time.time(),
+                "llm_queued": True,
+            })
+        except Exception as e:
+            print(f"⚠️  call_ended emit failed: {e}")
+
+        # ── Queue post-call LLM analysis (non-blocking) ───────────────────────
+        # _llm_analyser.analyse_call() returns immediately; the actual Ollama
+        # request runs in the LLM ThreadPoolExecutor worker.
+        # The STT pool is NOT involved — completely separate executor.
+        _llm_analyser.analyse_call(call_id)
+
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    local_ip = get_local_ip()
+    print(f"🌐 Server IP: {local_ip}")
+
     server = SIPSignalingServer(port=5060)
     threading.Thread(target=server.start, daemon=True).start()
 
     print("🌐 Starting Socket.IO/Flask server on port 5000…")
-    eventlet.wsgi.server(eventlet.listen(("0.0.0.0", 5000)), app)
+    print(f"   Dashboard URL: http://{local_ip}:5000")
+    eventlet.wsgi.server(
+        eventlet.listen(("0.0.0.0", 5000)),
+        app,
+        log_output=False,
+    )

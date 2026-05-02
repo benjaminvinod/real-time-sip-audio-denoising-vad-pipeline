@@ -1,32 +1,33 @@
 /**
- * app.js — SIP·VAD Monitor
- * Pure Socket.IO — zero polling.
- * Connects to sip_server.py Socket.IO server on port 5000.
- *
+ * app.js — SIP·VAD Monitor  (with post-call LLM analysis)
+ * =========================================================
  * Socket events handled:
  *   "connect"        — socket connected
  *   "disconnect"     — socket disconnected
  *   "connect_error"  — connection failure
- *   "processedAudio" — per-frame metrics  { seq, is_speech, total_frames,
- *                       speech_frames, silence_frames, speech_ratio,
- *                       avg_latency, fps, snr_db, raw_energy,
- *                       denoised_energy, speech_event, active_calls,
- *                       call_id }
- *   "transcript"     — STT result  { call_id, text, timestamp }
+ *   "processedAudio" — per-frame metrics
+ *   "transcript"     — live STT segment  { call_id, text, timestamp }
  *   "audioCleared"   — backend confirmed clear
+ *   "heartbeat"      — server keepalive  { ts }
+ *   "call_ended"     — BYE received, LLM queued  { call_id, ended_at, llm_queued }
+ *   "llm_report"     — post-call analysis result
+ *                       { call_id, report|null, error|null, meta }
+ *
+ * LLM report shape (when report !== null):
+ *   { summary, intent, sentiment, risk_level, suggested_action }
  */
 
 "use strict";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CONFIG — change SERVER_URL to match your backend machine
+// CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
-const SERVER_URL          = "http://192.168.31.129:5000";
-const ROLLING_WINDOW      = 60;      // chart data points
-const LOG_MAX             = 40;      // max event log rows
-const TX_MAX              = 50;      // max transcript rows
-const HEARTBEAT_TIMEOUT   = 4000;    // ms before badge goes IDLE
-const DEBUG               = new URLSearchParams(location.search).has("debug");
+const SERVER_URL        = "http://192.168.31.129:5000";
+const ROLLING_WINDOW    = 60;
+const LOG_MAX           = 40;
+const TX_MAX            = 50;
+const HEARTBEAT_TIMEOUT = 4000;
+const DEBUG             = new URLSearchParams(location.search).has("debug");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE
@@ -44,13 +45,12 @@ const buf = {
   snr:     [],
 };
 
-// Chart instances — set up after DOM ready
 let ratioChart = null;
 let perfChart  = null;
 let snrChart   = null;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SAFE DOM HELPER — prevents crashes if an element is missing
+// SAFE DOM HELPER
 // ═══════════════════════════════════════════════════════════════════════════
 function $(id) {
   return document.getElementById(id) || null;
@@ -60,12 +60,12 @@ function $(id) {
 // SOCKET.IO CONNECTION
 // ═══════════════════════════════════════════════════════════════════════════
 const socket = io(SERVER_URL, {
-  transports:            ["polling", "websocket"],  // polling first avoids WS upgrade race
-  reconnection:          true,
-  reconnectionAttempts:  Infinity,
-  reconnectionDelay:     1000,
-  reconnectionDelayMax:  5000,
-  timeout:               20000,
+  transports:           ["polling", "websocket"],
+  reconnection:         true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay:    1000,
+  reconnectionDelayMax: 5000,
+  timeout:              20000,
 });
 
 // ── connect ──────────────────────────────────────────────────────────────────
@@ -96,7 +96,6 @@ socket.on("processedAudio", (data) => {
 });
 
 // ── transcript ────────────────────────────────────────────────────────────────
-// Backend emits: { call_id: string, text: string, timestamp: number }
 socket.on("transcript", (data) => {
   dbg(`transcript call=${data.call_id} text="${data.text}"`);
   appendLog("event", `🧠 TRANSCRIPT [${shortCallId(data.call_id)}]: ${data.text}`);
@@ -109,22 +108,51 @@ socket.on("audioCleared", () => {
   appendLog("system", "🧹 Audio cleared by backend");
 });
 
+// ── heartbeat ────────────────────────────────────────────────────────────────
+socket.on("heartbeat", (data) => {
+  dbg("heartbeat");
+  resetHeartbeatTimer();
+  pulseHeartbeat();
+  const el = $("hb-ts");
+  if (el) el.textContent = new Date(data.ts * 1000).toLocaleTimeString();
+});
+
+// ── call_ended ────────────────────────────────────────────────────────────────
+// Fired by backend when BYE is processed, before LLM starts.
+// Show the LLM panel immediately with spinner + PROCESSING state.
+socket.on("call_ended", (data) => {
+  dbg(`call_ended call=${data.call_id} llm_queued=${data.llm_queued}`);
+  appendLog("event", `📴 Call ended [${shortCallId(data.call_id)}] — LLM analysis queued`);
+
+  if (data.llm_queued) {
+    handleLLMStart(data.call_id);
+  }
+});
+
+// ── llm_report ────────────────────────────────────────────────────────────────
+// Fired when Ollama finishes (or fails).
+socket.on("llm_report", (data) => {
+  dbg(`llm_report call=${data.call_id} error=${data.error}`);
+  if (data.error) {
+    handleLLMError(data);
+  } else {
+    handleLLMReport(data);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
-// FRAME HANDLER — called for every "processedAudio" event
+// FRAME HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 function handleFrame(d) {
   const now = new Date();
 
-  // ── Heartbeat ──
   resetHeartbeatTimer();
   pulseHeartbeat();
   const el = $("hb-ts");
   if (el) el.textContent = now.toLocaleTimeString();
 
-  // ── State badge ──
   setStateBadge(d.is_speech ? "SPEAKING" : "SILENT");
 
-  // ── Metric cards ──
   setMetric("m-total",   fmt(d.total_frames   ?? 0));
   setMetric("m-speech",  fmt(d.speech_frames  ?? 0));
   setMetric("m-silence", fmt(d.silence_frames ?? 0));
@@ -135,19 +163,16 @@ function handleFrame(d) {
   setVal("m-starts", d.speech_start ?? 0);
   setVal("m-ends",   d.speech_end   ?? 0);
 
-  // ── Health bar ──
   const ratio = Math.min(d.speech_ratio ?? 0, 100);
   setStyle("health-fill", "width", `${ratio}%`);
   setVal("health-val", `${ratio.toFixed(1)}%`);
   const calls = d.active_calls ?? 0;
   setVal("active-calls-label", `${calls} CALL${calls !== 1 ? "S" : ""}`);
 
-  // ── Footer ──
   setVal("footer-seq",   `SEQ #${d.seq ?? "—"}`);
   setVal("footer-calls", `${calls} active call${calls !== 1 ? "s" : ""}`);
   setVal("footer-ts",    now.toLocaleTimeString());
 
-  // ── Energy bars ──
   const rawE  = d.raw_energy      ?? 0;
   const clnE  = d.denoised_energy ?? 0;
   const maxE  = Math.max(rawE, clnE, 1);
@@ -156,7 +181,6 @@ function handleFrame(d) {
   const snrAbs = Math.abs(d.snr_db ?? 0);
   setBar("bar-delta", Math.min(snrAbs / 30, 1) * 100, "num-delta", `${(d.snr_db ?? 0).toFixed(1)} dB`);
 
-  // ── Rolling chart buffers ──
   const ts = now.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   bufPush(buf.labels,  ts);
   bufPush(buf.ratio,   d.speech_ratio ?? 0);
@@ -164,14 +188,12 @@ function handleFrame(d) {
   bufPush(buf.latency, d.avg_latency  ?? 0);
   bufPush(buf.snr,     d.snr_db       ?? 0);
 
-  // Live chart tags
   setVal("ratio-live", `${(d.speech_ratio ?? 0).toFixed(1)}%`);
   setVal("perf-live",  `${(d.fps ?? 0).toFixed(1)} fps`);
   setVal("snr-live",   `${(d.snr_db ?? 0).toFixed(1)} dB`);
 
   updateCharts();
 
-  // ── Event log (throttled — only speech events + every 10th frame) ──
   if (d.speech_event && d.speech_event !== "") {
     const icon = d.speech_event === "speech_start" ? "🗣" : "🤫";
     appendLog("event", `${icon} ${d.speech_event.toUpperCase()}  seq=${d.seq}  SNR=${(d.snr_db ?? 0).toFixed(1)}dB`);
@@ -182,35 +204,232 @@ function handleFrame(d) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TRANSCRIPT — dedicated section, never competes with the log
+// LLM PANEL HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * appendTranscript(callId, text, timestamp)
- *
- * Appends a new transcript entry at the BOTTOM of the transcript panel
- * (teletype / paper-tape order — newest at bottom) and auto-scrolls.
- * Safe: does nothing if the panel elements are missing.
+ * handleLLMStart(call_id)
+ * Called when "call_ended" arrives with llm_queued=true.
+ * Shows the LLM panel in PROCESSING state with spinner.
  */
+function handleLLMStart(callId) {
+  // Show panel
+  const panel = $("llm-panel");
+  if (panel) {
+    panel.classList.remove("hidden");
+  }
+
+  // Show spinner
+  const spinner = $("llm-spinner");
+  if (spinner) spinner.classList.remove("hidden");
+
+  // Status badge → PROCESSING
+  _setLLMStatus("PROCESSING", "processing");
+
+  // Call ID label
+  setVal("llm-call-id", shortCallId(callId));
+
+  // Clear previous report and error
+  const reportEl = $("llm-report-content");
+  if (reportEl) {
+    reportEl.classList.add("hidden");
+    reportEl.innerHTML = "";
+  }
+
+  const errEl = $("llm-error");
+  if (errEl) {
+    errEl.classList.add("hidden");
+    errEl.textContent = "";
+  }
+
+  // Clear meta footer
+  setVal("llm-meta", "");
+
+  appendLog("system", `🤖 LLM analysis started for [${shortCallId(callId)}]`);
+}
+
+/**
+ * handleLLMReport(data)
+ * Called when "llm_report" arrives with report !== null.
+ * Hides spinner, renders structured report.
+ *
+ * data shape: { call_id, report: { summary, intent, sentiment, risk_level, suggested_action }, meta }
+ */
+function handleLLMReport(data) {
+  const { call_id, report, meta } = data;
+
+  // Show panel
+  const panel = $("llm-panel");
+  if (panel) {
+    panel.classList.remove("hidden");
+  }
+
+  // Hide spinner
+  const spinner = $("llm-spinner");
+  if (spinner) spinner.classList.add("hidden");
+
+  // Status badge → COMPLETE
+  _setLLMStatus("COMPLETE", "complete");
+
+  // Update call ID
+  setVal("llm-call-id", shortCallId(call_id));
+
+  // Render report
+  const reportEl = $("llm-report-content");
+  if (reportEl) {
+    reportEl.classList.remove("hidden");
+
+    const sentimentClass = _sentimentClass(report?.sentiment);
+    const riskClass      = _riskClass(report?.risk_level);
+
+    reportEl.innerHTML = `
+      <div class="llm-field">
+        <div class="llm-field-label">SUMMARY</div>
+        <div class="llm-field-value summary-text">
+          ${escHtml(report?.summary ?? "—")}
+        </div>
+      </div>
+
+      <div class="llm-row-2">
+        <div class="llm-field">
+          <div class="llm-field-label">INTENT</div>
+          <div class="llm-field-value">
+            ${escHtml(report?.intent ?? "—")}
+          </div>
+        </div>
+
+        <div class="llm-field">
+          <div class="llm-field-label">SENTIMENT</div>
+          <span class="llm-badge ${sentimentClass}">
+            ${escHtml((report?.sentiment ?? "unknown").toUpperCase())}
+          </span>
+        </div>
+
+        <div class="llm-field">
+          <div class="llm-field-label">RISK LEVEL</div>
+          <span class="llm-badge ${riskClass}">
+            ${escHtml((report?.risk_level ?? "unknown").toUpperCase())}
+          </span>
+        </div>
+      </div>
+
+      <div class="llm-field">
+        <div class="llm-field-label">SUGGESTED ACTION</div>
+        <div class="llm-field-value action-text">
+          ${escHtml(report?.suggested_action ?? "—")}
+        </div>
+      </div>
+    `;
+  }
+
+  // Hide any previous error
+  const errEl = $("llm-error");
+  if (errEl) {
+    errEl.classList.add("hidden");
+    errEl.textContent = "";
+  }
+
+  // Meta footer
+  if (meta) {
+    const segs  = meta.segments ?? "?";
+    const ms    = meta.processing_ms != null ? `${meta.processing_ms.toFixed(0)} ms` : "?";
+    const chars = meta.length ?? "?";
+    setVal("llm-meta", `${chars} chars · ${segs} segments · processed in ${ms}`);
+  }
+
+  appendLog("event", `✅ LLM report ready [${shortCallId(call_id)}] — sentiment: ${report?.sentiment}, risk: ${report?.risk_level}`);
+}
+
+/**
+ * handleLLMError(data)
+ * Called when "llm_report" arrives with error !== null.
+ * Shows the error message in the panel.
+ *
+ * data shape: { call_id, report: null, error: string, meta }
+ */
+function handleLLMError(data) {
+  const { call_id, error } = data;
+
+  // Show panel
+  const panel = $("llm-panel");
+  if (panel) {
+    panel.classList.remove("hidden");
+  }
+
+  // Hide spinner
+  const spinner = $("llm-spinner");
+  if (spinner) spinner.classList.add("hidden");
+
+  // Status badge → ERROR
+  _setLLMStatus("ERROR", "error");
+
+  // Update call ID
+  setVal("llm-call-id", shortCallId(call_id));
+
+  // Clear report content
+  const reportEl = $("llm-report-content");
+  if (reportEl) {
+    reportEl.classList.add("hidden");
+    reportEl.innerHTML = "";
+  }
+
+  // Show error message
+  const errEl = $("llm-error");
+  if (errEl) {
+    errEl.textContent = error ?? "Unknown LLM error.";
+    errEl.classList.remove("hidden");
+  }
+
+  // Meta footer
+  setVal("llm-meta", "Analysis failed");
+
+  appendLog("error", `❌ LLM error [${shortCallId(call_id)}]: ${error}`);
+}
+
+// ── LLM panel helper: set status badge ───────────────────────────────────────
+function _setLLMStatus(text, modifier) {
+  const el = $("llm-status");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `llm-status-badge ${modifier}`;
+}
+
+// ── Badge CSS class helpers ───────────────────────────────────────────────────
+function _sentimentClass(sentiment) {
+  switch ((sentiment ?? "").toLowerCase()) {
+    case "positive": return "sentiment-positive";
+    case "negative": return "sentiment-negative";
+    case "mixed":    return "sentiment-mixed";
+    default:         return "sentiment-neutral";
+  }
+}
+
+function _riskClass(risk) {
+  switch ((risk ?? "").toLowerCase()) {
+    case "high":   return "risk-high";
+    case "medium": return "risk-medium";
+    default:       return "risk-low";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSCRIPT
+// ═══════════════════════════════════════════════════════════════════════════
 function appendTranscript(callId, text, timestamp) {
   const scroll = $("tx-scroll");
   if (!scroll) return;
 
-  // Remove the "awaiting" placeholder on first real entry
   const empty = $("tx-empty");
   if (empty) empty.remove();
 
-  // Trim oldest entries if over limit
   const rows = scroll.querySelectorAll(".tx-row");
   if (rows.length >= TX_MAX) {
     rows[0].remove();
   }
 
-  // Build row
   const row = document.createElement("div");
   row.className = "tx-row new-entry";
 
-  // Timestamp — prefer backend timestamp if provided, else now
   const ts = timestamp
     ? new Date(timestamp * 1000).toLocaleTimeString("en-US", { hour12: false })
     : new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -225,19 +444,14 @@ function appendTranscript(callId, text, timestamp) {
     <span class="tx-text">${escHtml(text ?? "")}</span>`;
 
   scroll.appendChild(row);
-
-  // Remove animation class after it plays so it doesn't replay on reflow
   row.addEventListener("animationend", () => row.classList.remove("new-entry"), { once: true });
 
-  // Auto-scroll to bottom
   scroll.scrollTop = scroll.scrollHeight;
 
-  // Update counter
   txCount++;
   setVal("tx-count", `${txCount} segment${txCount !== 1 ? "s" : ""}`);
 }
 
-// Shorten a SIP Call-ID to last 8 chars for display
 function shortCallId(id) {
   if (!id || id === "—") return "—";
   const s = String(id);
@@ -247,12 +461,6 @@ function shortCallId(id) {
 // ═══════════════════════════════════════════════════════════════════════════
 // EVENT LOG
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * appendLog(type, msg)
- * Types: system | speech | silence | event | warn | error
- * Entries are prepended (newest at top).
- */
 function appendLog(type, msg) {
   const log = $("event-log");
   if (!log) return;
@@ -266,14 +474,13 @@ function appendLog(type, msg) {
   logCount++;
   setVal("log-count", `${logCount} events`);
 
-  // Trim old entries
   while (log.children.length > LOG_MAX) {
     log.removeChild(log.lastChild);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CHARTS — initialised after DOM is ready (DOMContentLoaded)
+// CHARTS
 // ═══════════════════════════════════════════════════════════════════════════
 function initCharts() {
   const FONT  = { family: "'Share Tech Mono', monospace", size: 9 };
@@ -283,7 +490,7 @@ function initCharts() {
   const BASE = {
     responsive:          true,
     maintainAspectRatio: false,
-    animation:           { duration: 0 },   // no animation — keep RTP latency low
+    animation:           { duration: 0 },
     plugins: {
       legend:  { display: false },
       tooltip: { enabled: true, mode: "index", intersect: false,
@@ -305,7 +512,7 @@ function initCharts() {
   }
 
   // ── Speech Ratio ──
-  const rCtx  = $("chart-ratio")?.getContext("2d");
+  const rCtx = $("chart-ratio")?.getContext("2d");
   if (rCtx) {
     ratioChart = new Chart(rCtx, {
       type: "line",
@@ -330,7 +537,7 @@ function initCharts() {
   }
 
   // ── FPS + Latency dual-axis ──
-  const pCtx  = $("chart-perf")?.getContext("2d");
+  const pCtx = $("chart-perf")?.getContext("2d");
   if (pCtx) {
     perfChart = new Chart(pCtx, {
       type: "line",
@@ -359,7 +566,7 @@ function initCharts() {
   }
 
   // ── SNR ──
-  const sCtx  = $("chart-snr")?.getContext("2d");
+  const sCtx = $("chart-snr")?.getContext("2d");
   if (sCtx) {
     snrChart = new Chart(sCtx, {
       type: "line",
@@ -430,7 +637,7 @@ function pulseHeartbeat() {
   const icon = $("hb-icon");
   if (!icon) return;
   icon.classList.remove("pulse");
-  void icon.offsetWidth;       // force reflow to restart CSS animation
+  void icon.offsetWidth;
   icon.classList.add("pulse");
 }
 
@@ -466,7 +673,6 @@ async function clearAudio() {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    // Instant local reset — don't wait for socket event
     ["m-total","m-speech","m-silence"].forEach(id => setVal(id, "0"));
     setMetricHTML("m-ratio",   `0.0<span class="unit">%</span>`);
     setMetricHTML("m-latency", `0.0<span class="unit">ms</span>`);
@@ -498,37 +704,31 @@ function fmt(n) {
   return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 }
 
-// Set element textContent safely
 function setVal(id, val) {
   const el = $(id);
   if (el) el.textContent = String(val);
 }
 
-// Set element innerHTML safely
 function setMetricHTML(id, html) {
   const el = $(id);
   if (el) el.innerHTML = html;
 }
 
-// Set element textContent via innerHTML alias (for plain text metric cards)
 function setMetric(id, text) {
   const el = $(id);
   if (el) el.textContent = text;
 }
 
-// Set a style property safely
 function setStyle(id, prop, val) {
   const el = $(id);
   if (el) el.style[prop] = val;
 }
 
-// Set progress bar + label
 function setBar(barId, pct, numId, label) {
   setStyle(barId, "width", `${Math.min(Math.max(pct, 0), 100)}%`);
   setVal(numId, label);
 }
 
-// HTML-escape user/server-derived strings — prevents XSS
 function escHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -537,7 +737,6 @@ function escHtml(s) {
     .replace(/"/g, "&quot;");
 }
 
-// Debug logger — only active when ?debug=1 is in URL
 function dbg(msg) {
   if (!DEBUG) return;
   console.log(`[DBG] ${msg}`);
@@ -548,16 +747,19 @@ function dbg(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BOOT — wait for DOM, then init charts and log startup
+// BOOT
 // ═══════════════════════════════════════════════════════════════════════════
 document.addEventListener("DOMContentLoaded", () => {
   initCharts();
 
-  // Show debug bar if ?debug=1
   if (DEBUG) {
     const bar = $("debug-bar");
     if (bar) bar.classList.add("visible");
   }
+
+  // Hide LLM panel until a call ends
+  const llmPanel = $("llm-panel");
+  if (llmPanel) llmPanel.classList.add("hidden");
 
   appendLog("system", `Connecting to ${SERVER_URL} …`);
   setVal("footer-server", SERVER_URL);
