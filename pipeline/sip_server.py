@@ -37,17 +37,29 @@ LATEST_DATA = {
     "speech_count":  0,
     "silence_count": 0,
     "speech_ratio":  0.0,
-    "last_updated":  0.0,
+    "last_updated":  0.0,       # epoch timestamp — frontend uses this for heartbeat
     "connected":     False,
     "rtp_active":    False,
+    # ── NEW fields ────────────────────────────────────────────────────────────
+    "last_state":    "silence", # "speech" or "silence" — current VAD state
+    "avg_trt":       0.0,       # running average processing latency in ms
+    "fps":           0.0,       # frames processed in the last 1-second window
 }
+
+# Internal accumulator for avg_trt (not exposed to frontend directly)
+_trt_sum:   float = 0.0
+_trt_count: int   = 0
+
+# Internal deque for FPS sliding window — stores epoch timestamps of recent frames
+from collections import deque as _deque
+_frame_timestamps: _deque = _deque(maxlen=500)  # 500-frame cap on window
 
 
 class SocketEmitter:
     def __init__(self, sio):
         self.sio = sio
 
-    def send(self, seq, pcm16, is_speech):
+    def send(self, seq, pcm16, is_speech, trt_ms: float = 0.0):
         # ── Emit via Socket.IO (kept for future use) ──────────────────────────
         payload = {
             "seq":       seq,
@@ -57,6 +69,10 @@ class SocketEmitter:
         self.sio.emit("processedAudio", payload)
 
         # ── Write to global polling state ─────────────────────────────────────
+        global _trt_sum, _trt_count
+
+        now = time.time()
+
         LATEST_DATA["seq"]       = seq
         LATEST_DATA["is_speech"] = is_speech
         LATEST_DATA["frame_count"] += 1
@@ -69,8 +85,28 @@ class SocketEmitter:
         LATEST_DATA["speech_ratio"] = (
             LATEST_DATA["speech_count"] / total * 100 if total > 0 else 0.0
         )
-        LATEST_DATA["last_updated"] = time.time()
+        LATEST_DATA["last_updated"] = now
         LATEST_DATA["rtp_active"]   = True
+
+        # ── Feature 2: last_state ─────────────────────────────────────────────
+        # Plain string label derived from VAD result — "speech" or "silence"
+        LATEST_DATA["last_state"] = "speech" if is_speech else "silence"
+
+        # ── Feature 3: avg_trt ────────────────────────────────────────────────
+        # Accumulate running average of per-frame processing latency (ms).
+        # trt_ms is passed in from RTPReceiver which already measures t_recv.
+        if trt_ms > 0:
+            _trt_sum   += trt_ms
+            _trt_count += 1
+            LATEST_DATA["avg_trt"] = _trt_sum / _trt_count
+
+        # ── Feature 4: fps ────────────────────────────────────────────────────
+        # Append current timestamp to the sliding window deque, then count
+        # how many entries fall within the last 1 second.
+        _frame_timestamps.append(now)
+        cutoff = now - 1.0
+        fps = sum(1 for t in _frame_timestamps if t >= cutoff)
+        LATEST_DATA["fps"] = float(fps)
 
 
 # ── Flask polling endpoints ───────────────────────────────────────────────────
@@ -90,11 +126,16 @@ def health():
 @app.route("/reset")
 def reset():
     """Reset counters — callable from Streamlit's Reset button."""
+    global _trt_sum, _trt_count
+    _trt_sum   = 0.0
+    _trt_count = 0
+    _frame_timestamps.clear()
     LATEST_DATA.update({
         "seq": 0, "is_speech": False,
         "frame_count": 0, "speech_count": 0,
         "silence_count": 0, "speech_ratio": 0.0,
         "last_updated": time.time(), "rtp_active": False,
+        "last_state": "silence", "avg_trt": 0.0, "fps": 0.0,
     })
     return jsonify({"status": "reset"})
 
@@ -241,7 +282,13 @@ class RTPReceiver:
                     self._seq, frame, t_recv, self.metrics, emitter=self.emitter
                 )
 
+                # Compute per-frame processing latency in ms
+                trt_ms = (time.perf_counter() - t_recv) * 1000.0
+
                 self.sender.send(denoised)
+                # Pass trt_ms to emitter so avg_trt stays accurate
+                if self.emitter:
+                    self.emitter.send(self._seq, denoised, is_speech, trt_ms=trt_ms)
                 self._seq += 1
 
         print("🛑 RTP Listener stopped.")
