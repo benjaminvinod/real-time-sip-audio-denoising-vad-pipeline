@@ -43,6 +43,8 @@ import samplerate
 from flask import Flask, jsonify, request
 import socketio
 
+from db_manager import init_db, save_call, get_recent_calls, get_call
+
 from denoiseVADHandler import DenoiseVADHandler
 from metricsLogger import MetricsLogger
 from ai_client import send_to_ai  # stub — safe import
@@ -61,6 +63,8 @@ sio = socketio.Server(
 )
 app = Flask(__name__)
 app.wsgi_app = socketio.WSGIApp(sio, app.wsgi_app)
+
+init_db()
 
 
 # ── Socket.IO lifecycle ───────────────────────────────────────────────────────
@@ -264,6 +268,18 @@ def calls_endpoint():
             "state":      sess.get("state", "unknown"),
             "started_at": sess.get("started_at", 0),
         })
+    return jsonify(result)
+
+@app.route("/history")
+def history():
+    return jsonify(get_recent_calls(10))
+
+
+@app.route("/call/<call_id>")
+def call_detail(call_id):
+    result = get_call(call_id)
+    if not result:
+        return jsonify({"error": "not found"}), 404
     return jsonify(result)
 
 
@@ -863,6 +879,17 @@ class LLMAnalyser:
                     "processing_ms": round(elapsed_ms, 1),
                 },
             }
+
+            # ── SAVE TO DATABASE ─────────────────────────────
+            save_call(
+                call_id=call_id,
+                transcript=full_text,
+                report=report,
+                meta={
+                    "length": len(full_text),
+                    "processing_ms": round(elapsed_ms, 1),
+                }
+            )
 
             # Grab segment count safely
             with _transcripts_lock:
