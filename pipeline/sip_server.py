@@ -28,6 +28,7 @@ import heapq
 import json
 import random
 import re
+import os
 import socket
 import struct
 import threading
@@ -60,8 +61,15 @@ sio = socketio.Server(
     max_http_buffer_size=1_000_000,
     logger=False,
     engineio_logger=False,
+    allow_upgrades=True,
+    transports=["polling", "websocket"],
 )
-app = Flask(__name__)
+app = Flask(__name__, static_folder=os.path.join(os.path.dirname(__file__), '..', 'web_ui'), static_url_path='')
+
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
 app.wsgi_app = socketio.WSGIApp(sio, app.wsgi_app)
 
 init_db()
@@ -291,7 +299,7 @@ def _heartbeat_loop():
         with _data_lock:
             LATEST_DATA["server_ts"] = time.time()
 
-threading.Thread(target=_heartbeat_loop, daemon=True).start()
+eventlet.spawn(_heartbeat_loop)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -888,7 +896,8 @@ class LLMAnalyser:
                 meta={
                     "length": len(full_text),
                     "processing_ms": round(elapsed_ms, 1),
-                }
+                },
+                llm_status="llm_success"
             )
 
             # Grab segment count safely
@@ -936,6 +945,22 @@ class LLMAnalyser:
         try:
             with _transcripts_lock:
                 segments = len(CALL_TRANSCRIPTS.get(call_id, []))
+                full_text = " ".join(CALL_TRANSCRIPTS.get(call_id, []))
+
+            save_call(
+                call_id=call_id,
+                transcript=full_text,
+                report={
+                    "summary": None,
+                    "intent": None,
+                    "sentiment": None,
+                    "risk_level": None,
+                    "suggested_action": None,
+                },
+                meta={"error": error_msg},
+                llm_status="llm_failed",
+                llm_error=error_msg
+            )
 
             sio.emit("llm_report", {
                 "call_id": call_id,

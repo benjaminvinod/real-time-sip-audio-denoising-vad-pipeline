@@ -32,7 +32,9 @@ def init_db():
         sentiment TEXT,
         risk_level TEXT,
         suggested_action TEXT,
-        meta TEXT
+        meta TEXT,
+        llm_status TEXT DEFAULT 'no_llm',
+        llm_error TEXT
     )
     """)
 
@@ -44,7 +46,7 @@ def init_db():
 # ─────────────────────────────────────────────
 # SAVE CALL
 # ─────────────────────────────────────────────
-def save_call(call_id, transcript, report, meta=None):
+def save_call(call_id, transcript, report, meta=None, llm_status="no_llm", llm_error=None):
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -59,9 +61,11 @@ def save_call(call_id, transcript, report, meta=None):
             sentiment,
             risk_level,
             suggested_action,
-            meta
+            meta,
+            llm_status,
+            llm_error
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             call_id,
             datetime.utcnow().isoformat(),
@@ -71,7 +75,9 @@ def save_call(call_id, transcript, report, meta=None):
             report.get("sentiment"),
             report.get("risk_level"),
             report.get("suggested_action"),
-            json.dumps(meta or {})
+            json.dumps(meta or {}),
+            llm_status,
+            llm_error
         ))
 
         conn.commit()
