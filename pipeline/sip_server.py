@@ -329,6 +329,37 @@ CALL_TRANSCRIPTS: dict = {}   # call_id → list[str]
 _transcripts_lock = threading.Lock()
 
 
+def _reset_call_metrics():
+    """
+    Zero all global per-call counters so every fresh INVITE starts clean.
+    Called at the start of _handle_invite() for non-retransmit INVITEs only.
+    """
+    global _trt_sum, _trt_count
+    _trt_sum   = 0.0
+    _trt_count = 0
+    _frame_timestamps.clear()
+    with _data_lock:
+        LATEST_DATA.update({
+            "seq":                0,
+            "is_speech":          False,
+            "frame_count":        0,
+            "speech_count":       0,
+            "silence_count":      0,
+            "speech_ratio":       0.0,
+            "last_updated":       time.time(),
+            "rtp_active":         False,
+            "last_state":         "silence",
+            "avg_trt":            0.0,
+            "fps":                0.0,
+            "raw_energy":         0.0,
+            "denoised_energy":    0.0,
+            "snr_db":             0.0,
+            "speech_start_count": 0,
+            "speech_end_count":   0,
+            "server_ts":          time.time(),
+        })
+
+
 def _alloc_rtp_port() -> int:
     with _port_lock:
         for p in _RTP_PORT_POOL:
@@ -582,17 +613,24 @@ class STTManager:
     def _load_model(self):
         if self._model is not None:
             return self._model
+
         with self._model_lock:
             if self._model is None:
                 from faster_whisper import WhisperModel
-                print("📦 [STT] Loading Whisper tiny (CPU)…")
+
+                model_name = "small"
+
+                print(f"📦 [STT] Loading Whisper {model_name} (CPU, int8, local)...")
+
                 self._model = WhisperModel(
-                    "tiny",
+                    model_name,
                     device="cpu",
                     compute_type="int8",
                     local_files_only=True,
                 )
-                print("✅ [STT] Whisper model ready")
+
+                print(f"✅ [STT] Whisper {model_name} model loaded successfully")
+
         return self._model
 
     def submit(self, audio_np: np.ndarray, call_id: str) -> bool:
@@ -635,8 +673,8 @@ class STTManager:
             segments, _ = model.transcribe(
                 audio_f32,
                 language="en",
-                beam_size=1,
-                best_of=1,
+                beam_size=3,
+                best_of=3,
                 temperature=0.0,
                 vad_filter=False,
             )
@@ -1153,6 +1191,13 @@ class SIPSignalingServer:
 
         print(f"📞 Fresh INVITE [{call_id}]")
 
+        # Reset all accumulated metrics so call 2+ starts from zero
+        _reset_call_metrics()
+        try:
+            sio.emit("call_started", {"call_id": call_id, "ts": time.time()})
+        except Exception as e:
+            print(f"⚠️  call_started emit failed: {e}")
+
         trying = build_100_trying(headers, self._local_ip, addr)
         self.sock.sendto(trying.encode(), addr)
         print("📤 100 Trying sent")
@@ -1215,10 +1260,12 @@ class SIPSignalingServer:
         print(f"✅ ACK [{call_id}] — starting RTP")
         session["state"] = "active"
 
-        threading.Thread(
+        rtp_thread = threading.Thread(
             target=session["rtp_receiver"].listen,
             daemon=True,
-        ).start()
+        )
+        session["rtp_thread"] = rtp_thread
+        rtp_thread.start()
 
         print(f"🎙️  RTP live for call [{call_id}]")
 
@@ -1254,6 +1301,21 @@ class SIPSignalingServer:
             if rr:
                 rr.running = False
                 rr._speech_buffer.clear()
+                # Close the UDP socket immediately so recvfrom() unblocks and
+                # the listener thread exits NOW — not after the 1-second timeout.
+                # Without this, a back-to-back INVITE can arrive before the old
+                # thread releases the port, causing the new RTPReceiver's packets
+                # to be stolen by the dying thread.
+                try:
+                    rr.sock.close()
+                except Exception:
+                    pass
+                # Give the thread up to 1.5 s to actually exit before we hand
+                # the port back to the pool.  This prevents the new RTPReceiver
+                # from racing on the same port number.
+                rtp_thread = session.get("rtp_thread")
+                if rtp_thread and rtp_thread.is_alive():
+                    rtp_thread.join(timeout=1.5)
                 _free_rtp_port(rr.port)
             if rs:
                 rs.close()
