@@ -22,7 +22,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t2.medium
-      ImageId: ami-xxxxxxxx   # <-- Replace with your AMI ID
+      ImageId: ami-xxxxxxxx   # Replace with AMI ID
       SecurityGroupIds:
         - !Ref DenoiseSecurityGroup
       Tags:
