@@ -78,7 +78,7 @@ SQLite + Live Dashboard
 
 ## Processing Pipeline Flowchart
 
-![Pipeline Flowchart](pipeline_flowchat_ieee.png)
+![Pipeline Flowchart](pipeline_flowchart_ieee.png)
 
 ---
 
